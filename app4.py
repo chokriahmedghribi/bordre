@@ -1,4 +1,4 @@
-# app.py - مع سكربت إنشاء البوردرية المحدث
+# app.py - مع سكربت إنشاء البوردرية المحدث والنظام المحسن
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,13 +8,15 @@ from datetime import datetime, date, timedelta
 import json
 import tempfile
 import io
+import hashlib
+import secrets
 from database import get_db_connection, log_activity
 from docxtpl import DocxTemplate
 import warnings
 warnings.filterwarnings('ignore')
 
 st.set_page_config(
-    page_title="نظام مكتب النظام - معهد حي الأمل بقابس",
+    page_title="المدرسة الإعدادية حي الامل قابس - مكتب الضبط",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -50,16 +52,31 @@ if 'bordereau_data' not in st.session_state:
     st.session_state.bordereau_data = None
 if 'bordereau_buffer' not in st.session_state:
     st.session_state.bordereau_buffer = None
+if 'manage_users_mode' not in st.session_state:
+    st.session_state.manage_users_mode = "view"
 
-# --- نظام المصادقة ---
+# --- دالة التجزئة لكلمات المرور ---
+def hash_password(password):
+    """تجزئة كلمة المرور باستخدام SHA256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def generate_temp_password(length=8):
+    """توليد كلمة مرور مؤقتة"""
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+# --- نظام المصادقة المحسن ---
 def authenticate_user(username, password):
     """مصادقة المستخدم"""
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    hashed_password = hash_password(password)
+    
     cursor.execute('''
-    SELECT id, username, full_name, role, email FROM users 
+    SELECT id, username, full_name, role, email, is_active FROM users 
     WHERE username = ? AND password = ? AND is_active = 1
-    ''', (username, password))
+    ''', (username, hashed_password))
     user = cursor.fetchone()
     conn.close()
     
@@ -69,7 +86,8 @@ def authenticate_user(username, password):
             'username': user[1],
             'full_name': user[2],
             'role': user[3],
-            'email': user[4]
+            'email': user[4],
+            'is_active': user[5]
         }
         log_activity(user[0], "تسجيل دخول", f"المستخدم {user[2]} سجل دخول")
         return True
@@ -82,6 +100,221 @@ def logout_user():
     st.session_state.user = None
     st.session_state.page = "لوحة القيادة"
     st.rerun()
+
+def check_permission(required_permission="view"):
+    """
+    التحقق من صلاحيات المستخدم
+    
+    الصلاحيات:
+    - admin: يمكنه كل شيء
+    - user: يمكنه إضافة وتعديل البريد
+    - viewer: يمكنه فقط الاستعلام والقراءة
+    """
+    if not st.session_state.user:
+        return False
+    
+    user_role = st.session_state.user['role']
+    
+    # تعريف صلاحيات كل دور
+    permissions = {
+        'admin': ['view', 'add', 'edit', 'delete', 'manage_users', 'export'],
+        'user': ['view', 'add', 'edit', 'export'],
+        'viewer': ['view', 'export']
+    }
+    
+    # التحقق من أن الدور موجود في القائمة
+    if user_role not in permissions:
+        return False
+    
+    # التحقق من الصلاحية المطلوبة
+    return required_permission in permissions[user_role]
+
+# --- وظائف إدارة المستخدمين ---
+def get_all_users():
+    """جلب جميع المستخدمين"""
+    conn = get_db_connection()
+    try:
+        df = pd.read_sql("""
+            SELECT id, username, full_name, role, email, 
+                   created_at, last_login, is_active,
+                   CASE WHEN role = 'admin' THEN 'مشرف'
+                        WHEN role = 'user' THEN 'مستخدم'
+                        WHEN role = 'viewer' THEN 'مستشار'
+                        ELSE role END as role_display
+            FROM users 
+            ORDER BY created_at DESC
+        """, conn)
+    except Exception as e:
+        st.error(f"خطأ في جلب المستخدمين: {str(e)}")
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    return df
+
+def create_user(username, full_name, email, role, password=None):
+    """إنشاء مستخدم جديد"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # التحقق من أن اسم المستخدم غير مستخدم
+        cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+        if cursor.fetchone():
+            return False, "اسم المستخدم موجود مسبقاً"
+        
+        # توليد كلمة مرور مؤقتة إذا لم يتم تقديم واحدة
+        if not password:
+            temp_password = generate_temp_password()
+        else:
+            temp_password = password
+        
+        hashed_password = hash_password(temp_password)
+        
+        cursor.execute('''
+        INSERT INTO users (username, password, full_name, email, role, is_active, created_by)
+        VALUES (?, ?, ?, ?, ?, 1, ?)
+        ''', (username, hashed_password, full_name, email, role, st.session_state.user['id']))
+        
+        conn.commit()
+        log_activity(st.session_state.user['id'], "إنشاء مستخدم", 
+                   f"تم إنشاء مستخدم جديد: {username}")
+        
+        return True, temp_password
+    
+    except Exception as e:
+        return False, f"خطأ في إنشاء المستخدم: {str(e)}"
+    
+    finally:
+        conn.close()
+
+def update_user(user_id, full_name=None, email=None, role=None, is_active=None):
+    """تحديث بيانات المستخدم"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        updates = []
+        params = []
+        
+        if full_name is not None:
+            updates.append("full_name = ?")
+            params.append(full_name)
+        
+        if email is not None:
+            updates.append("email = ?")
+            params.append(email)
+        
+        if role is not None:
+            updates.append("role = ?")
+            params.append(role)
+        
+        if is_active is not None:
+            updates.append("is_active = ?")
+            params.append(1 if is_active else 0)
+        
+        if updates:
+            params.append(user_id)
+            query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
+            cursor.execute(query, params)
+            conn.commit()
+            
+            log_activity(st.session_state.user['id'], "تحديث مستخدم", 
+                       f"تم تحديث بيانات المستخدم ID: {user_id}")
+            return True, "تم تحديث بيانات المستخدم بنجاح"
+        
+        return False, "لا توجد تحديثات لإجرائها"
+    
+    except Exception as e:
+        return False, f"خطأ في تحديث المستخدم: {str(e)}"
+    
+    finally:
+        conn.close()
+
+def reset_user_password(user_id):
+    """إعادة تعيين كلمة مرور المستخدم"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # توليد كلمة مرور مؤقتة جديدة
+        temp_password = generate_temp_password()
+        hashed_password = hash_password(temp_password)
+        
+        cursor.execute("UPDATE users SET password = ? WHERE id = ?", 
+                      (hashed_password, user_id))
+        conn.commit()
+        
+        log_activity(st.session_state.user['id'], "إعادة تعيين كلمة مرور", 
+                   f"تم إعادة تعيين كلمة مرور المستخدم ID: {user_id}")
+        
+        return True, temp_password
+    
+    except Exception as e:
+        return False, f"خطأ في إعادة تعيين كلمة المرور: {str(e)}"
+    
+    finally:
+        conn.close()
+
+def change_own_password(old_password, new_password):
+    """تغيير كلمة مرور المستخدم الحالي"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # التحقق من كلمة المرور القديمة
+        user_id = st.session_state.user['id']
+        hashed_old = hash_password(old_password)
+        
+        cursor.execute("SELECT id FROM users WHERE id = ? AND password = ?", 
+                      (user_id, hashed_old))
+        
+        if not cursor.fetchone():
+            return False, "كلمة المرور القديمة غير صحيحة"
+        
+        # تحديث كلمة المرور الجديدة
+        hashed_new = hash_password(new_password)
+        cursor.execute("UPDATE users SET password = ? WHERE id = ?", 
+                      (hashed_new, user_id))
+        conn.commit()
+        
+        log_activity(user_id, "تغيير كلمة المرور", "تم تغيير كلمة المرور بنجاح")
+        return True, "تم تغيير كلمة المرور بنجاح"
+    
+    except Exception as e:
+        return False, f"خطأ في تغيير كلمة المرور: {str(e)}"
+    
+    finally:
+        conn.close()
+
+def delete_user(user_id):
+    """حذف مستخدم"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # التحقق من أن المستخدم ليس المشرف الوحيد
+        cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1")
+        admin_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+        user_role = cursor.fetchone()[0]
+        
+        if user_role == 'admin' and admin_count <= 1:
+            return False, "لا يمكن حذف المشرف الوحيد في النظام"
+        
+        # حذف المستخدم
+        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+        
+        log_activity(st.session_state.user['id'], "حذف مستخدم", 
+                   f"تم حذف المستخدم ID: {user_id}")
+        return True, "تم حذف المستخدم بنجاح"
+    
+    except Exception as e:
+        return False, f"خطأ في حذف المستخدم: {str(e)}"
+    
+    finally:
+        conn.close()
 
 # --- الوظائف المساعدة ---
 def generate_ref_no(mail_type="incoming"):
@@ -129,7 +362,7 @@ def get_contacts():
     return df
 
 def get_users():
-    """جلب جميع المستخدمين"""
+    """جلب جميع المستخدمين (للأغراض العامة)"""
     conn = get_db_connection()
     try:
         df = pd.read_sql("SELECT id, username, full_name, role FROM users WHERE is_active = 1 ORDER BY full_name", conn)
@@ -296,6 +529,9 @@ def generate_bordereau_for_mail(mail_data, contact_info=None):
 # --- وظائف تصدير إلى Excel ---
 def export_incoming_to_excel():
     """تصدير البريد الوارد إلى Excel"""
+    if not check_permission('export'):
+        return None
+    
     conn = get_db_connection()
     
     query = """
@@ -339,6 +575,9 @@ def export_incoming_to_excel():
 
 def export_outgoing_to_excel():
     """تصدير البريد الصادر إلى Excel"""
+    if not check_permission('export'):
+        return None
+    
     conn = get_db_connection()
     
     query = """
@@ -410,8 +649,8 @@ def login_screen():
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.markdown('<div class="institution-title">معهد حي الأمل بقابس</div>', unsafe_allow_html=True)
-        st.markdown('<div class="system-title">نظام مكتب النظام</div>', unsafe_allow_html=True)
+        st.markdown('<div class="institution-title">المدرسة الإعدادية حي الأمل   </div>', unsafe_allow_html=True)
+        st.markdown('<div class="system-title">مكتب الضبط  </div>', unsafe_allow_html=True)
         
         st.markdown('<p style="text-align: center; color: #666; margin-bottom: 30px;">الرجاء تسجيل الدخول للوصول إلى النظام</p>', unsafe_allow_html=True)
         
@@ -427,7 +666,297 @@ def login_screen():
                 else:
                     st.error("اسم المستخدم أو كلمة المرور غير صحيحة")
 
-# --- وظائف عرض الصفحات ---
+# --- واجهة إدارة المستخدمين ---
+def display_user_management():
+    """عرض واجهة إدارة المستخدمين"""
+    st.markdown('<div class="card"><h3>إدارة المستخدمين</h3></div>', unsafe_allow_html=True)
+    
+    if not check_permission('manage_users'):
+        st.warning("⚠️ ليس لديك الصلاحية للوصول إلى إدارة المستخدمين")
+        return
+    
+    # أزرار التنقل بين أنماط الإدارة
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("👁️ عرض المستخدمين", use_container_width=True, key="view_users_btn"):
+            st.session_state.manage_users_mode = "view"
+            st.rerun()
+    
+    with col2:
+        if st.button("➕ إضافة مستخدم جديد", use_container_width=True, key="add_user_btn"):
+            st.session_state.manage_users_mode = "add"
+            st.rerun()
+    
+    with col3:
+        if st.button("🔐 تغيير كلمة المرور", use_container_width=True, key="change_pass_btn"):
+            st.session_state.manage_users_mode = "change_password"
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # عرض المحتوى حسب النمط المختار
+    if st.session_state.manage_users_mode == "view":
+        display_users_list()
+    elif st.session_state.manage_users_mode == "add":
+        display_add_user_form()
+    elif st.session_state.manage_users_mode == "change_password":
+        display_change_password_form()
+
+def display_users_list():
+    """عرض قائمة المستخدمين"""
+    st.markdown("### قائمة المستخدمين")
+    
+    users_df = get_all_users()
+    
+    if not users_df.empty:
+        # إضافة أعمدة عرض
+        users_df['الحالة'] = users_df['is_active'].apply(lambda x: '✅ نشط' if x == 1 else '❌ غير نشط')
+        
+        # البحث والتصفية
+        search_col1, search_col2, search_col3 = st.columns(3)
+        
+        with search_col1:
+            search_name = st.text_input("🔍 البحث بالاسم")
+        
+        with search_col2:
+            search_username = st.text_input("🔍 البحث باسم المستخدم")
+        
+        with search_col3:
+            search_role = st.selectbox("🔍 التصفية بالدور", ["الكل", "مشرف", "مستخدم", "مستشار"])
+        
+        # تطبيق البحث والتصفية
+        filtered_df = users_df.copy()
+        
+        if search_name:
+            filtered_df = filtered_df[filtered_df['full_name'].str.contains(search_name, case=False, na=False)]
+        
+        if search_username:
+            filtered_df = filtered_df[filtered_df['username'].str.contains(search_username, case=False, na=False)]
+        
+        if search_role != "الكل":
+            filtered_df = filtered_df[filtered_df['role_display'] == search_role]
+        
+        # عرض البيانات
+        display_cols = ['username', 'full_name', 'email', 'role_display', 'الحالة', 'created_at']
+        
+        if not filtered_df.empty:
+            st.dataframe(
+                filtered_df[display_cols].rename(columns={
+                    'username': 'اسم المستخدم',
+                    'full_name': 'الاسم الكامل',
+                    'email': 'البريد الإلكتروني',
+                    'role_display': 'الدور',
+                    'created_at': 'تاريخ الإنشاء'
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # خيارات إدارة لكل مستخدم
+            st.markdown("### إدارة المستخدم المحدد")
+            
+            selected_user = st.selectbox(
+                "اختر مستخدم لإدارته",
+                filtered_df['full_name'].tolist()
+            )
+            
+            if selected_user:
+                user_data = filtered_df[filtered_df['full_name'] == selected_user].iloc[0]
+                
+                col_edit, col_reset, col_delete = st.columns(3)
+                
+                with col_edit:
+                    if st.button("✏️ تعديل البيانات", use_container_width=True, key=f"edit_{user_data['id']}"):
+                        display_edit_user_form(user_data)
+                
+                with col_reset:
+                    if st.button("🔄 إعادة تعيين كلمة المرور", use_container_width=True, key=f"reset_{user_data['id']}"):
+                        success, result = reset_user_password(user_data['id'])
+                        if success:
+                            st.success(f"✅ تم إعادة تعيين كلمة المرور بنجاح!")
+                            st.info(f"**كلمة المرور الجديدة:** {result}")
+                            st.warning("⚠️ الرجاء إبلاغ المستخدم بكلمة المرور الجديدة")
+                        else:
+                            st.error(result)
+                
+                with col_delete:
+                    if st.button("🗑️ حذف المستخدم", use_container_width=True, key=f"delete_{user_data['id']}"):
+                        if st.checkbox(f"⚠️ تأكيد حذف المستخدم: {selected_user}"):
+                            success, message = delete_user(user_data['id'])
+                            if success:
+                                st.success(message)
+                                st.rerun()
+                            else:
+                                st.error(message)
+            
+            # إحصائيات
+            st.markdown("---")
+            col_stats1, col_stats2, col_stats3 = st.columns(3)
+            
+            with col_stats1:
+                active_count = users_df['is_active'].sum()
+                st.metric("المستخدمين النشطين", active_count)
+            
+            with col_stats2:
+                admin_count = len(users_df[users_df['role'] == 'admin'])
+                st.metric("المشرفين", admin_count)
+            
+            with col_stats3:
+                viewer_count = len(users_df[users_df['role'] == 'viewer'])
+                st.metric("المستشارين", viewer_count)
+        
+        else:
+            st.info("لم يتم العثور على مستخدمين مطابقين للبحث")
+    
+    else:
+        st.info("لا توجد مستخدمين مسجلين في النظام")
+
+def display_add_user_form():
+    """عرض نموذج إضافة مستخدم جديد"""
+    st.markdown("### إضافة مستخدم جديد")
+    
+    with st.form("add_user_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            username = st.text_input("اسم المستخدم *", placeholder="يجب أن يكون فريداً")
+            full_name = st.text_input("الاسم الكامل *", placeholder="الاسم الثلاثي")
+            email = st.text_input("البريد الإلكتروني", placeholder="example@domain.com")
+        
+        with col2:
+            role = st.selectbox("الدور *", ["admin", "user", "viewer"], 
+                              format_func=lambda x: {
+                                  'admin': 'مشرف (صلاحيات كاملة)',
+                                  'user': 'مستخدم (يمكنه الإضافة والتعديل)',
+                                  'viewer': 'مستشار (يمكنه الاستعلام فقط)'
+                              }[x])
+            
+            password_option = st.radio("خيارات كلمة المرور", 
+                                      ["توليد كلمة مرور تلقائياً", "تحديد كلمة مرور يدوياً"])
+            
+            if password_option == "تحديد كلمة مرور يدوياً":
+                custom_password = st.text_input("كلمة المرور المخصصة", type="password")
+            else:
+                custom_password = None
+        
+        col_submit, col_cancel = st.columns(2)
+        with col_submit:
+            submitted = st.form_submit_button("💾 إضافة المستخدم", use_container_width=True)
+        
+        with col_cancel:
+            if st.form_submit_button("إلغاء", use_container_width=True):
+                st.session_state.manage_users_mode = "view"
+                st.rerun()
+        
+        if submitted:
+            if not username or not full_name:
+                st.error("الرجاء ملء الحقول الإلزامية (*)")
+            else:
+                success, result = create_user(username, full_name, email, role, custom_password)
+                
+                if success:
+                    st.success(f"✅ تم إنشاء المستخدم {full_name} بنجاح!")
+                    
+                    if not custom_password:
+                        st.info(f"**تم توليد كلمة المرور تلقائياً:** {result}")
+                        st.warning("⚠️ الرجاء إبلاغ المستخدم بكلمة المرور الجديدة")
+                    
+                    # إعادة تعيين النموذج
+                    st.session_state.manage_users_mode = "view"
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result}")
+
+def display_edit_user_form(user_data):
+    """عرض نموذج تعديل بيانات المستخدم"""
+    st.markdown(f"### تعديل بيانات المستخدم: {user_data['full_name']}")
+    
+    with st.form("edit_user_form"):
+        full_name = st.text_input("الاسم الكامل *", value=user_data['full_name'])
+        email = st.text_input("البريد الإلكتروني", value=user_data['email'])
+        
+        # للتحقق من صلاحيات التعديل
+        can_change_role = check_permission('manage_users')
+        
+        if can_change_role:
+            role = st.selectbox("الدور *", ["admin", "user", "viewer"], 
+                              index=["admin", "user", "viewer"].index(user_data['role']),
+                              format_func=lambda x: {
+                                  'admin': 'مشرف (صلاحيات كاملة)',
+                                  'user': 'مستخدم (يمكنه الإضافة والتعديل)',
+                                  'viewer': 'مستشار (يمكنه الاستعلام فقط)'
+                              }[x])
+        else:
+            role = user_data['role']
+            st.info(f"الدور: {user_data['role_display']} (لا يمكن تغيير الدور)")
+        
+        is_active = st.checkbox("المستخدم نشط", value=bool(user_data['is_active']))
+        
+        col_submit, col_cancel = st.columns(2)
+        with col_submit:
+            submitted = st.form_submit_button("💾 حفظ التعديلات", use_container_width=True)
+        
+        with col_cancel:
+            if st.form_submit_button("إلغاء", use_container_width=True):
+                st.rerun()
+        
+        if submitted:
+            if not full_name:
+                st.error("الرجاء إدخال الاسم الكامل")
+            else:
+                success, message = update_user(
+                    user_data['id'],
+                    full_name=full_name,
+                    email=email,
+                    role=role if can_change_role else None,
+                    is_active=is_active
+                )
+                
+                if success:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+def display_change_password_form():
+    """عرض نموذج تغيير كلمة مرور المستخدم الحالي"""
+    st.markdown("### تغيير كلمة المرور")
+    
+    with st.form("change_password_form"):
+        st.markdown("#### تغيير كلمة مرورك الخاصة")
+        
+        old_password = st.text_input("كلمة المرور الحالية *", type="password")
+        new_password = st.text_input("كلمة المرور الجديدة *", type="password")
+        confirm_password = st.text_input("تأكيد كلمة المرور الجديدة *", type="password")
+        
+        col_submit, col_cancel = st.columns(2)
+        with col_submit:
+            submitted = st.form_submit_button("🔄 تغيير كلمة المرور", use_container_width=True)
+        
+        with col_cancel:
+            if st.form_submit_button("إلغاء", use_container_width=True):
+                st.session_state.manage_users_mode = "view"
+                st.rerun()
+        
+        if submitted:
+            if not old_password or not new_password or not confirm_password:
+                st.error("الرجاء ملء جميع الحقول")
+            elif new_password != confirm_password:
+                st.error("كلمتا المرور غير متطابقتين")
+            elif len(new_password) < 6:
+                st.error("كلمة المرور يجب أن تكون 6 أحرف على الأقل")
+            else:
+                success, message = change_own_password(old_password, new_password)
+                
+                if success:
+                    st.success(message)
+                    st.session_state.manage_users_mode = "view"
+                    st.rerun()
+                else:
+                    st.error(message)
+
+# --- وظائف عرض الصفحات (المحدثة مع الصلاحيات) ---
 def display_dashboard():
     """عرض لوحة القيادة"""
     conn = get_db_connection()
@@ -504,6 +1033,10 @@ def display_dashboard():
 
 def display_incoming_mail():
     """عرض البريد الوارد"""
+    if not check_permission('view'):
+        st.warning("⚠️ ليس لديك صلاحية لعرض البريد الوارد")
+        return
+    
     conn = get_db_connection()
     
     st.markdown('<div class="card"><h3>إدارة البريد الوارد</h3></div>', unsafe_allow_html=True)
@@ -524,15 +1057,16 @@ def display_incoming_mail():
             show_incoming_stats()
     
     with col_stats:
-        excel_data = export_incoming_to_excel()
-        if excel_data:
-            st.download_button(
-                label="📥 تصدير إلى Excel",
-                data=excel_data,
-                file_name=f"البريد_الوارد_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+        if check_permission('export'):
+            excel_data = export_incoming_to_excel()
+            if excel_data:
+                st.download_button(
+                    label="📥 تصدير إلى Excel",
+                    data=excel_data,
+                    file_name=f"البريد_الوارد_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
     
     # تطبيق التصفية
     if st.session_state.mail_filter == "الكل":
@@ -626,21 +1160,27 @@ def display_incoming_mail():
                             st.rerun()
                     
                     with col_edit:
-                        if st.button("✏️", key=f"edit_{row['id']}", help="تعديل"):
-                            st.session_state.edit_mail_id = row['id']
-                            st.session_state.edit_mail_type = "incoming"
-                            st.rerun()
+                        if check_permission('edit'):
+                            if st.button("✏️", key=f"edit_{row['id']}", help="تعديل"):
+                                st.session_state.edit_mail_id = row['id']
+                                st.session_state.edit_mail_type = "incoming"
+                                st.rerun()
+                        else:
+                            st.button("✏️", key=f"edit_{row['id']}", help="تعديل", disabled=True)
                     
                     with col_delete:
-                        if st.button("🗑️", key=f"delete_{row['id']}", help="حذف"):
-                            if st.button(f"⚠️ تأكيد حذف {row['reference_no']}", key=f"confirm_delete_{row['id']}"):
-                                cursor = conn.cursor()
-                                cursor.execute("DELETE FROM incoming_mail WHERE id = ?", (row['id'],))
-                                conn.commit()
-                                log_activity(st.session_state.user['id'], "حذف بريد وارد", 
-                                           f"{row['reference_no']}")
-                                st.success("تم حذف البريد الوارد")
-                                st.rerun()
+                        if check_permission('delete'):
+                            if st.button("🗑️", key=f"delete_{row['id']}", help="حذف"):
+                                if st.button(f"⚠️ تأكيد حذف {row['reference_no']}", key=f"confirm_delete_{row['id']}"):
+                                    cursor = conn.cursor()
+                                    cursor.execute("DELETE FROM incoming_mail WHERE id = ?", (row['id'],))
+                                    conn.commit()
+                                    log_activity(st.session_state.user['id'], "حذف بريد وارد", 
+                                               f"{row['reference_no']}")
+                                    st.success("تم حذف البريد الوارد")
+                                    st.rerun()
+                        else:
+                            st.button("🗑️", key=f"delete_{row['id']}", help="حذف", disabled=True)
                 
                 st.divider()
         
@@ -652,46 +1192,12 @@ def display_incoming_mail():
     
     conn.close()
 
-def show_incoming_stats():
-    """عرض إحصائيات البريد الوارد"""
-    conn = get_db_connection()
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        try:
-            total = pd.read_sql("SELECT COUNT(*) FROM incoming_mail", conn).iloc[0,0]
-            st.metric("إجمالي البريد", total)
-        except:
-            st.metric("إجمالي البريد", 0)
-    
-    with col2:
-        try:
-            new = pd.read_sql("SELECT COUNT(*) FROM incoming_mail WHERE status = 'جديد'", conn).iloc[0,0]
-            st.metric("جديد", new)
-        except:
-            st.metric("جديد", 0)
-    
-    with col3:
-        try:
-            urgent = pd.read_sql("SELECT COUNT(*) FROM incoming_mail WHERE priority = 'عاجل'", conn).iloc[0,0]
-            st.metric("عاجل", urgent)
-        except:
-            st.metric("عاجل", 0)
-    
-    # مخطط توزيع الحالات
-    try:
-        status_dist = pd.read_sql("SELECT status, COUNT(*) as count FROM incoming_mail GROUP BY status", conn)
-        if not status_dist.empty:
-            st.markdown("### توزيع الحالات")
-            st.bar_chart(status_dist.set_index('status'))
-    except:
-        pass
-    
-    conn.close()
-
 def register_incoming_mail():
     """تسجيل بريد وارد جديد"""
+    if not check_permission('add'):
+        st.warning("⚠️ ليس لديك صلاحية لتسجيل بريد وارد جديد")
+        return
+    
     st.markdown('<div class="card"><h3>تسجيل بريد وارد جديد</h3></div>', unsafe_allow_html=True)
     
     with st.form("incoming_mail_form"):
@@ -758,6 +1264,10 @@ def register_incoming_mail():
 
 def display_outgoing_mail():
     """عرض البريد الصادر"""
+    if not check_permission('view'):
+        st.warning("⚠️ ليس لديك صلاحية لعرض البريد الصادر")
+        return
+    
     conn = get_db_connection()
     
     st.markdown('<div class="card"><h3>إدارة البريد الصادر</h3></div>', unsafe_allow_html=True)
@@ -772,16 +1282,17 @@ def display_outgoing_mail():
                 st.session_state.mail_filter = filter_name
     
     # زر التصدير إلى Excel
-    excel_data = export_outgoing_to_excel()
-    if excel_data:
-        st.download_button(
-            label="📥 تصدير إلى Excel",
-            data=excel_data,
-            file_name=f"البريد_الصادر_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="export_outgoing_excel"
-        )
+    if check_permission('export'):
+        excel_data = export_outgoing_to_excel()
+        if excel_data:
+            st.download_button(
+                label="📥 تصدير إلى Excel",
+                data=excel_data,
+                file_name=f"البريد_الصادر_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="export_outgoing_excel"
+            )
     
     # تطبيق التصفية
     if st.session_state.mail_filter == "الكل":
@@ -843,10 +1354,13 @@ def display_outgoing_mail():
                             st.rerun()
                     
                     with col_edit:
-                        if st.button("✏️", key=f"edit_out_{row['id']}", help="تعديل"):
-                            st.session_state.edit_mail_id = row['id']
-                            st.session_state.edit_mail_type = "outgoing"
-                            st.rerun()
+                        if check_permission('edit'):
+                            if st.button("✏️", key=f"edit_out_{row['id']}", help="تعديل"):
+                                st.session_state.edit_mail_id = row['id']
+                                st.session_state.edit_mail_type = "outgoing"
+                                st.rerun()
+                        else:
+                            st.button("✏️", key=f"edit_out_{row['id']}", help="تعديل", disabled=True)
                 
                 st.divider()
         
@@ -859,6 +1373,10 @@ def display_outgoing_mail():
 
 def create_outgoing_mail():
     """إنشاء بريد صادر جديد"""
+    if not check_permission('add'):
+        st.warning("⚠️ ليس لديك صلاحية لإنشاء بريد صادر جديد")
+        return
+    
     st.markdown('<div class="card"><h3>إنشاء بريد صادر جديد</h3></div>', unsafe_allow_html=True)
     
     contacts_df = get_contacts()
@@ -985,560 +1503,6 @@ def create_outgoing_mail():
                 finally:
                     conn.close()
 
-def edit_incoming_mail(mail_id):
-    """تعديل البريد الوارد مع إمكانية إزالة تاريخ الاستحقاق عند المعالجة"""
-    st.markdown('<div class="card"><h3>تعديل البريد الوارد</h3></div>', unsafe_allow_html=True)
-    
-    mail_data = get_mail_by_id(mail_id, "incoming")
-    
-    if not mail_data:
-        st.error("البريد غير موجود")
-        st.session_state.edit_mail_id = None
-        st.session_state.edit_mail_type = None
-        return
-    
-    with st.form("edit_incoming_mail_form"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            reference_no = st.text_input("رقم المرجع", value=mail_data['reference_no'], disabled=True)
-            sender_name = st.text_input("اسم المرسل *", value=mail_data['sender_name'])
-            subject = st.text_input("الموضوع *", value=mail_data['subject'])
-        
-        with col2:
-            priority = st.selectbox("الأولوية", ["عادي", "مهم", "عاجل"], 
-                                  index=["عادي", "مهم", "عاجل"].index(mail_data['priority']))
-            status = st.selectbox("الحالة", ["جديد", "قيد المعالجة", "مكتمل", "ملغي"], 
-                                index=["جديد", "قيد المعالجة", "مكتمل", "ملغي"].index(mail_data['status']))
-            
-            received_date = st.date_input("تاريخ الاستلام", 
-                                        value=datetime.strptime(mail_data['received_date'], '%Y-%m-%d').date())
-        
-        # تاريخ الاستحقاق - يمكن إزالته إذا كانت الحالة "مكتمل"
-        col_due1, col_due2 = st.columns(2)
-        with col_due1:
-            show_due_date = st.checkbox("تعديل تاريخ الاستحقاق", value=mail_data['due_date'] is not None)
-        
-        with col_due2:
-            if show_due_date:
-                due_date = st.date_input("تاريخ الاستحقاق", 
-                                       value=datetime.strptime(mail_data['due_date'], '%Y-%m-%d').date() if mail_data['due_date'] else date.today())
-            else:
-                due_date = None
-        
-        # إذا كانت الحالة "مكتمل" أو "ملغي"، يمكن إزالة تاريخ الاستحقاق
-        if status in ["مكتمل", "ملغي"]:
-            st.info("⚠️ تمت معالجة البريد، يمكن إزالة تاريخ الاستحقاق")
-            remove_due_date = st.checkbox("إزالة تاريخ الاستحقاق (لأن البريد تمت معالجته)")
-            if remove_due_date:
-                due_date = None
-        
-        content = st.text_area("محتوى الرسالة", value=mail_data['content'] or "", height=150)
-        notes = st.text_area("ملاحظات إضافية", value=mail_data['notes'] or "", height=100)
-        
-        current_attachments = get_attachment_list(mail_data['attachments'])
-        if current_attachments:
-            st.markdown("**المرفقات الحالية:**")
-            for att in current_attachments:
-                st.markdown(f"- {att}")
-        
-        new_files = st.file_uploader("إرفاق مستندات جديدة", 
-                                    type=['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png'],
-                                    accept_multiple_files=True)
-        
-        col_save, col_cancel = st.columns(2)
-        with col_save:
-            submitted = st.form_submit_button("💾 حفظ التعديلات", use_container_width=True)
-        
-        with col_cancel:
-            if st.form_submit_button("إلغاء", use_container_width=True):
-                st.session_state.edit_mail_id = None
-                st.session_state.edit_mail_type = None
-                st.rerun()
-        
-        if submitted:
-            if not sender_name or not subject:
-                st.error("الرجاء ملء الحقول الإلزامية (*)")
-            else:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                try:
-                    new_attachments = []
-                    if new_files:
-                        for file in new_files:
-                            filepath = save_uploaded_file(file, "incoming")
-                            if filepath:
-                                new_attachments.append(os.path.basename(filepath))
-                    
-                    all_attachments = current_attachments + new_attachments
-                    
-                    cursor.execute('''
-                    UPDATE incoming_mail SET 
-                    sender_name = ?, subject = ?, content = ?, priority = ?, 
-                    status = ?, received_date = ?, due_date = ?, attachments = ?, notes = ?
-                    WHERE id = ?
-                    ''', (sender_name, subject, content, priority, status,
-                          received_date.strftime('%Y-%m-%d'),
-                          due_date.strftime('%Y-%m-%d') if due_date else None,
-                          json.dumps(all_attachments) if all_attachments else None,
-                          notes, mail_id))
-                    
-                    conn.commit()
-                    log_activity(st.session_state.user['id'], "تعديل بريد وارد", 
-                               f"تم تعديل بريد: {reference_no}")
-                    st.success("✅ تم تحديث البريد الوارد بنجاح!")
-                    
-                    st.session_state.edit_mail_id = None
-                    st.session_state.edit_mail_type = None
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"❌ خطأ في التحديث: {str(e)}")
-                finally:
-                    conn.close()
-
-def edit_outgoing_mail(mail_id):
-    """تعديل البريد الصادر"""
-    st.markdown('<div class="card"><h3>تعديل البريد الصادر</h3></div>', unsafe_allow_html=True)
-    
-    mail_data = get_mail_by_id(mail_id, "outgoing")
-    
-    if not mail_data:
-        st.error("البريد غير موجود")
-        st.session_state.edit_mail_id = None
-        st.session_state.edit_mail_type = None
-        return
-    
-    contacts_df = get_contacts()
-    contact_names = ["--- اختر من جهات الاتصال ---"] + contacts_df['name'].tolist() if not contacts_df.empty else ["--- لا توجد جهات اتصال ---"]
-    
-    with st.form("edit_outgoing_mail_form"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            reference_no = st.text_input("رقم المرجع", value=mail_data['reference_no'], disabled=True)
-            
-            current_recipient = mail_data['recipient_name']
-            recipient_index = contact_names.index(current_recipient) if current_recipient in contact_names else 0
-            recipient_choice = st.selectbox("اختر المستلم", contact_names, index=recipient_index)
-            
-            if recipient_choice == "--- اختر من جهات الاتصال ---":
-                st.warning("الرجاء اختيار المستلم من قائمة جهات الاتصال")
-                recipient_name = ""
-                recipient_id = None
-            else:
-                recipient_name = recipient_choice
-                recipient_id = contacts_df[contacts_df['name'] == recipient_choice].iloc[0]['id'] if not contacts_df.empty else None
-            
-            subject = st.text_input("الموضوع *", value=mail_data['subject'])
-        
-        with col2:
-            priority = st.selectbox("الأولوية", ["عادي", "مهم", "عاجل"], 
-                                  index=["عادي", "مهم", "عاجل"].index(mail_data['priority']))
-            category = st.selectbox("التصنيف", ["إداري", "مالي", "فني", "قانوني", "أخرى"], 
-                                  index=["إداري", "مالي", "فني", "قانوني", "أخرى"].index(mail_data['category']) if mail_data['category'] in ["إداري", "مالي", "فني", "قانوني", "أخرى"] else 0)
-            
-            status = st.selectbox("الحالة", ["مسودة", "مرسل", "مؤرشف"], 
-                                index=["مسودة", "مرسل", "مؤرشف"].index(mail_data['status']))
-            
-            sent_date = st.date_input("تاريخ الإرسال", 
-                                    value=datetime.strptime(mail_data['sent_date'], '%Y-%m-%d').date() if mail_data['sent_date'] else date.today())
-        
-        content = st.text_area("محتوى الرسالة", value=mail_data['content'] or "", height=150)
-        notes = st.text_area("ملاحظات إضافية", value=mail_data['notes'] or "", height=100)
-        
-        current_attachments = get_attachment_list(mail_data['attachments'])
-        if current_attachments:
-            st.markdown("**المرفقات الحالية:**")
-            for att in current_attachments:
-                st.markdown(f"- {att}")
-        
-        new_files = st.file_uploader("إرفاق مستندات جديدة", 
-                                    type=['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png'],
-                                    accept_multiple_files=True)
-        
-        col_save, col_cancel = st.columns(2)
-        with col_save:
-            submitted = st.form_submit_button("💾 حفظ التعديلات", use_container_width=True)
-        
-        with col_cancel:
-            if st.form_submit_button("إلغاء", use_container_width=True):
-                st.session_state.edit_mail_id = None
-                st.session_state.edit_mail_type = None
-                st.rerun()
-        
-        if submitted:
-            if not recipient_name or not subject:
-                st.error("الرجاء ملء الحقول الإلزامية (*)")
-            else:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                try:
-                    new_attachments = []
-                    if new_files:
-                        for file in new_files:
-                            filepath = save_uploaded_file(file, "outgoing")
-                            if filepath:
-                                new_attachments.append(os.path.basename(filepath))
-                    
-                    all_attachments = current_attachments + new_attachments
-                    
-                    cursor.execute('''
-                    UPDATE outgoing_mail SET 
-                    recipient_id = ?, recipient_name = ?, subject = ?, content = ?, 
-                    priority = ?, category = ?, status = ?, sent_date = ?,
-                    attachments = ?, notes = ?
-                    WHERE id = ?
-                    ''', (recipient_id, recipient_name, subject, content, priority, 
-                          category, status, sent_date.strftime('%Y-%m-%d'),
-                          json.dumps(all_attachments) if all_attachments else None,
-                          notes, mail_id))
-                    
-                    conn.commit()
-                    log_activity(st.session_state.user['id'], "تعديل بريد صادر", 
-                               f"تم تعديل بريد: {reference_no}")
-                    st.success("✅ تم تحديث البريد الصادر بنجاح!")
-                    
-                    st.session_state.edit_mail_id = None
-                    st.session_state.edit_mail_type = None
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"❌ خطأ في التحديث: {str(e)}")
-                finally:
-                    conn.close()
-
-def view_mail_details(mail_id, mail_type):
-    """عرض تفاصيل البريد في صفحة كاملة"""
-    st.markdown('<div class="card"><h3>تفاصيل البريد</h3></div>', unsafe_allow_html=True)
-    
-    mail_data = get_mail_by_id(mail_id, mail_type)
-    
-    if not mail_data:
-        st.error("البريد غير موجود")
-        st.session_state.view_mail_id = None
-        st.session_state.view_mail_type = None
-        return
-    
-    # أزرار الإجراءات
-    col_back, col_export = st.columns([1, 1])
-    with col_back:
-        if st.button("⬅️ العودة", use_container_width=True):
-            st.session_state.view_mail_id = None
-            st.session_state.view_mail_type = None
-            st.rerun()
-    
-    # عرض التفاصيل
-    if mail_type == "incoming":
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("### 📋 معلومات أساسية")
-            st.markdown(f"**رقم المرجع:** {mail_data['reference_no']}")
-            st.markdown(f"**المرسل:** {mail_data['sender_name']}")
-            st.markdown(f"**تاريخ الاستلام:** {mail_data['received_date']}")
-            st.markdown(f"**تاريخ الاستحقاق:** {mail_data['due_date'] or 'غير محدد'}")
-            
-            if mail_data['due_date']:
-                try:
-                    due_date = datetime.strptime(mail_data['due_date'], '%Y-%m-%d').date()
-                    days_left = (due_date - date.today()).days
-                    if days_left < 0:
-                        st.error(f"⏰ تجاوز تاريخ الاستحقاق ب {abs(days_left)} يوم")
-                    elif days_left <= 3:
-                        st.warning(f"⏰ متبقي {days_left} يوم للاستحقاق")
-                    else:
-                        st.info(f"⏰ متبقي {days_left} يوم للاستحقاق")
-                except:
-                    pass
-        
-        with col2:
-            st.markdown("### 📊 معلومات إضافية")
-            st.markdown(f"**الأولوية:** {mail_data['priority']}")
-            st.markdown(f"**الحالة:** {mail_data['status']}")
-            st.markdown(f"**التصنيف:** {mail_data.get('category', 'غير محدد')}")
-            st.markdown(f"**تاريخ الإنشاء:** {mail_data.get('created_at', 'غير معروف')}")
-    else:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("### 📋 معلومات أساسية")
-            st.markdown(f"**رقم المرجع:** {mail_data['reference_no']}")
-            st.markdown(f"**المستلم:** {mail_data['recipient_name']}")
-            st.markdown(f"**تاريخ الإرسال:** {mail_data['sent_date']}")
-            st.markdown(f"**الحالة:** {mail_data['status']}")
-        
-        with col2:
-            st.markdown("### 📊 معلومات إضافية")
-            st.markdown(f"**الأولوية:** {mail_data['priority']}")
-            st.markdown(f"**التصنيف:** {mail_data.get('category', 'غير محدد')}")
-            st.markdown(f"**تاريخ الإنشاء:** {mail_data.get('created_at', 'غير معروف')}")
-            
-            if mail_data.get('bordereau'):
-                st.markdown(f"**البوردرية:** {mail_data['bordereau']}")
-    
-    st.markdown("---")
-    st.markdown(f"### 📝 الموضوع")
-    st.markdown(f"**{mail_data['subject']}**")
-    
-    if mail_data.get('content'):
-        st.markdown(f"### 📄 المحتوى")
-        st.markdown(mail_data['content'])
-    
-    if mail_data.get('notes'):
-        st.markdown(f"### 📌 ملاحظات")
-        st.markdown(mail_data['notes'])
-    
-    # عرض المرفقات
-    attachments = get_attachment_list(mail_data.get('attachments'))
-    if attachments:
-        st.markdown("---")
-        st.markdown("### 📎 المرفقات")
-        
-        if mail_type == "incoming":
-            upload_dir = "uploads/incoming"
-        else:
-            upload_dir = "uploads/outgoing"
-        
-        for att in attachments:
-            file_path = os.path.join(upload_dir, att)
-            if os.path.exists(file_path):
-                with open(file_path, "rb") as f:
-                    st.download_button(
-                        label=f"تحميل {att}",
-                        data=f,
-                        file_name=att,
-                        mime="application/octet-stream",
-                        key=f"download_{att}_{mail_id}"
-                    )
-            else:
-                st.warning(f"الملف {att} غير موجود")
-
-def display_bordereau_generator():
-    """عرض واجهة إنشاء البوردرية"""
-    st.markdown('<div class="card"><h3>منشئ البوردرية</h3></div>', unsafe_allow_html=True)
-    
-    # خياران: إنشاء بوردرية جديدة أو لبريد محدد
-    option = st.radio(
-        "اختر الخيار:",
-        ["إنشاء بوردرية جديدة", "إنشاء بوردرية لبريد صادر محدد"],
-        horizontal=True
-    )
-    
-    if option == "إنشاء بوردرية لبريد صادر محدد":
-        # جلب قائمة البريد الصادر
-        conn = get_db_connection()
-        outgoing_mails = pd.read_sql("SELECT id, reference_no, recipient_name, subject FROM outgoing_mail ORDER BY sent_date DESC", conn)
-        conn.close()
-        
-        if not outgoing_mails.empty:
-            mail_options = {f"{row['reference_no']} - {row['recipient_name']}": row['id'] 
-                          for _, row in outgoing_mails.iterrows()}
-            
-            mail_list = list(mail_options.keys())
-            selected_mail = st.selectbox(
-                "اختر البريد الصادر:",
-                options=mail_list
-            )
-            
-            if selected_mail:
-                mail_id = mail_options[selected_mail]
-                show_bordereau_generator(mail_id)
-        else:
-            st.info("لا توجد بريد صادر. يمكنك إنشاء بوردرية جديدة.")
-            show_bordereau_generator()
-    else:
-        show_bordereau_generator()
-
-def show_bordereau_generator(mail_id=None):
-    """
-    عرض واجهة إنشاء البوردرية
-    
-    Args:
-        mail_id (int): ID البريد الصادر (اختياري)
-    """
-    st.markdown("### 📄 إنشاء بوردرية للبريد الصادر")
-    
-    # قسم معلومات القالب
-    st.markdown("#### 1. معلومات القالب")
-    if not os.path.exists("templates/bordereau_template.docx"):
-        st.error("❌ قالب البوردرية غير موجود. الرجاء وضع القالب في: templates/bordereau_template.docx")
-        st.info("""
-        **متغيرات القالب المطلوبة:**
-        - {{ reference_no }} : رقم المرجع
-        - {{ sent_date }} : تاريخ الإرسال
-        - {{ recipient_name }} : اسم المستلم
-        - {{ organization }} : المؤسسة
-        - {{ phone }} : الهاتف
-        - {{ email }} : البريد الإلكتروني
-        - {{ subject }} : الموضوع
-        - {{ notes }} : الملاحظات
-        """)
-        return
-    
-    st.success("✅ تم العثور على قالب البوردرية في templates/bordereau_template.docx")
-    
-    # قسم إدخال البيانات
-    st.markdown("#### 2. إدخال بيانات البريد")
-    
-    if mail_id:
-        # إذا كان هناك بريد محدد، جلب بياناته
-        mail_data = get_mail_by_id(mail_id, "outgoing")
-        if mail_data:
-            recipient_id = mail_data.get('recipient_id')
-            contact_info = get_contact_by_id(recipient_id) if recipient_id else None
-        else:
-            mail_data = {}
-            contact_info = None
-    else:
-        mail_data = {}
-        contact_info = None
-    
-    # إعداد حقول الإدخال
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        reference_no = st.text_input(
-            "رقم المرجع *",
-            value=mail_data.get('reference_no', generate_ref_no("outgoing")),
-            placeholder="مثال: ص-0001-01-2024",
-            key="bordereau_ref"
-        )
-        
-        # جلب قائمة جهات الاتصال
-        contacts_df = get_contacts()
-        contact_names = ["--- اختر من جهات الاتصال ---"] + contacts_df['name'].tolist() if not contacts_df.empty else ["--- لا توجد جهات اتصال ---"]
-        
-        current_recipient = mail_data.get('recipient_name', '')
-        recipient_index = contact_names.index(current_recipient) if current_recipient in contact_names else 0
-        recipient_choice = st.selectbox(
-            "اختر المستلم *",
-            contact_names,
-            index=recipient_index,
-            key="bordereau_recipient"
-        )
-        
-        if recipient_choice == "--- اختر من جهات الاتصال ---":
-            st.warning("الرجاء اختيار المستلم من قائمة جهات الاتصال")
-            recipient_name = ""
-            recipient_id = None
-        else:
-            recipient_name = recipient_choice
-            recipient_id = contacts_df[contacts_df['name'] == recipient_choice].iloc[0]['id'] if not contacts_df.empty else None
-            
-            # عرض معلومات جهة الاتصال
-            if recipient_id and not contact_info:
-                contact_info = get_contact_by_id(recipient_id)
-        
-        subject = st.text_input(
-            "الموضوع *",
-            value=mail_data.get('subject', ''),
-            placeholder="موضوع البريد",
-            key="bordereau_subject"
-        )
-    
-    with col2:
-        sent_date = st.date_input(
-            "تاريخ الإرسال *",
-            value=datetime.strptime(mail_data.get('sent_date', date.today().strftime('%Y-%m-%d')), '%Y-%m-%d').date() if mail_data.get('sent_date') else date.today(),
-            key="bordereau_date"
-        )
-        
-        # عرض معلومات جهة الاتصال إذا كانت متوفرة
-        if contact_info:
-            st.info(f"""
-            **معلومات المستلم:**
-            - المؤسسة: {contact_info.get('organization', 'غير محدد')}
-            - الهاتف: {contact_info.get('phone', 'غير محدد')}
-            - البريد: {contact_info.get('email', 'غير محدد')}
-            """)
-    
-    notes = st.text_area(
-        "ملاحظات",
-        value=mail_data.get('notes', ''),
-        placeholder="أي ملاحظات إضافية...",
-        height=100,
-        key="bordereau_notes"
-    )
-    
-    # زر إنشاء البوردرية (خارج النموذج)
-    if st.button("🔄 إنشاء البوردرية", key="generate_bordereau_btn"):
-        if not reference_no or not recipient_name or not subject:
-            st.error("❌ الرجاء ملء جميع الحقول الإلزامية (*)")
-        elif recipient_choice == "--- اختر من جهات الاتصال ---":
-            st.error("❌ الرجاء اختيار المستلم من قائمة جهات الاتصال")
-        else:
-            # إعداد بيانات البريد
-            mail_context = {
-                'reference_no': reference_no,
-                'sent_date': sent_date.strftime('%Y-%m-%d'),
-                'recipient_name': recipient_name,
-                'subject': subject,
-                'notes': notes
-            }
-            
-            # إنشاء البوردرية
-            buffer = generate_bordereau_for_mail(mail_context, contact_info)
-            
-            if buffer:
-                # حفظ البوردرية في حالة الجلسة
-                st.session_state.bordereau_buffer = buffer
-                st.session_state.bordereau_data = {
-                    'reference_no': reference_no,
-                    'sent_date': sent_date.strftime('%Y-%m-%d'),
-                    'recipient_name': recipient_name,
-                    'subject': subject,
-                    'notes': notes,
-                    'mail_id': mail_id,
-                    'recipient_id': recipient_id
-                }
-                st.success("✅ تم إنشاء البوردرية بنجاح!")
-    
-    # عرض زر التحميل إذا كان هناك بوردرية جاهزة
-    if st.session_state.bordereau_buffer:
-        st.markdown("---")
-        st.markdown("#### 3. تحميل البوردرية")
-        
-        bordereau_data = st.session_state.bordereau_data
-        if bordereau_data:
-            st.download_button(
-                label="📥 تحميل البوردرية",
-                data=st.session_state.bordereau_buffer,
-                file_name=f"بوردرية_{bordereau_data['reference_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="download_bordereau"
-            )
-            
-            # إذا كان هناك بريد محدد، حفظ البوردرية في قاعدة البيانات
-            if bordereau_data['mail_id'] and bordereau_data['recipient_id']:
-                if st.button("💾 حفظ البوردرية للسجلات", key="save_bordereau_record"):
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    
-                    # حفظ البوردرية
-                    upload_dir = "uploads/bordereau"
-                    os.makedirs(upload_dir, exist_ok=True)
-                    bordereau_filename = f"بوردرية_{bordereau_data['reference_no']}.docx"
-                    bordereau_path = os.path.join(upload_dir, bordereau_filename)
-                    
-                    with open(bordereau_path, "wb") as f:
-                        f.write(st.session_state.bordereau_buffer.getvalue())
-                    
-                    # تحديث قاعدة البيانات
-                    cursor.execute(
-                        "UPDATE outgoing_mail SET bordereau = ? WHERE id = ?",
-                        (bordereau_filename, bordereau_data['mail_id'])
-                    )
-                    conn.commit()
-                    conn.close()
-                    
-                    st.success(f"✅ تم حفظ البوردرية للسجلات: {bordereau_filename}")
-                    
-                    # إعادة تعيين الحالة
-                    st.session_state.bordereau_buffer = None
-                    st.session_state.bordereau_data = None
-                    st.rerun()
-
 def display_contacts():
     """عرض وإدارة جهات الاتصال"""
     st.markdown('<div class="card"><h3>إدارة جهات الاتصال</h3></div>', unsafe_allow_html=True)
@@ -1639,7 +1603,7 @@ def display_contacts():
     else:
         st.info("📭 لا توجد جهات اتصال مسجلة")
 
-# --- واجهة التطبيق الرئيسية ---
+# --- الواجهة الرئيسية ---
 def main_interface():
     """الواجهة الرئيسية بعد تسجيل الدخول"""
     
@@ -1664,8 +1628,8 @@ def main_interface():
         </style>
         """, unsafe_allow_html=True)
         
-        st.markdown('<div class="sidebar-title">معهد حي الأمل بقابس</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-subtitle">نظام مكتب النظام</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-title">المدرسة الإعدادية حي الأمل </div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-subtitle">مكتب الضبط </div>', unsafe_allow_html=True)
         
         st.markdown("---")
         
@@ -1673,12 +1637,18 @@ def main_interface():
         menu_options = {
             "📊 لوحة القيادة": "لوحة القيادة",
             "📥 البريد الوارد": "البريد الوارد",
-            "➕ تسجيل بريد وارد": "تسجيل بريد وارد",
             "📤 البريد الصادر": "البريد الصادر",
-            "✏️ إنشاء بريد صادر": "إنشاء بريد صادر",
             "📇 جهات الاتصال": "جهات الاتصال",
             "📄 إنشاء بوردرية": "إنشاء بوردرية"
         }
+        
+        # إضافة خيارات حسب الصلاحيات
+        if check_permission('add'):
+            menu_options["➕ تسجيل بريد وارد"] = "تسجيل بريد وارد"
+            menu_options["✏️ إنشاء بريد صادر"] = "إنشاء بريد صادر"
+        
+        if check_permission('manage_users'):
+            menu_options["👥 إدارة المستخدمين"] = "إدارة المستخدمين"
         
         for icon_text, page_name in menu_options.items():
             if st.button(icon_text, key=f"menu_{page_name}", use_container_width=True):
@@ -1711,15 +1681,16 @@ def main_interface():
         st.markdown(f'<div style="text-align: right; color: #666;">{today}</div>', unsafe_allow_html=True)
     
     # التحقق من تواريخ الاستحقاق القريبة
-    reminders = check_due_date_reminders()
-    if not reminders.empty:
-        with st.expander("📢 تنبيه: بريد وارد قريب من تاريخ الاستحقاق", expanded=True):
-            for idx, row in reminders.iterrows():
-                days_left = (datetime.strptime(row['due_date'], '%Y-%m-%d').date() - date.today()).days
-                if days_left < 0:
-                    st.error(f"**{row['reference_no']}** - {row['subject']} - تجاوز الاستحقاق ب {abs(days_left)} يوم")
-                else:
-                    st.warning(f"**{row['reference_no']}** - {row['subject']} - متبقي {days_left} يوم للاستحقاق")
+    if check_permission('view'):
+        reminders = check_due_date_reminders()
+        if not reminders.empty:
+            with st.expander("📢 تنبيه: بريد وارد قريب من تاريخ الاستحقاق", expanded=True):
+                for idx, row in reminders.iterrows():
+                    days_left = (datetime.strptime(row['due_date'], '%Y-%m-%d').date() - date.today()).days
+                    if days_left < 0:
+                        st.error(f"**{row['reference_no']}** - {row['subject']} - تجاوز الاستحقاق ب {abs(days_left)} يوم")
+                    else:
+                        st.warning(f"**{row['reference_no']}** - {row['subject']} - متبقي {days_left} يوم للاستحقاق")
     
     st.markdown(f'<h1>{st.session_state.page}</h1>', unsafe_allow_html=True)
     
@@ -1748,6 +1719,8 @@ def main_interface():
         display_contacts()
     elif st.session_state.page == "إنشاء بوردرية":
         display_bordereau_generator()
+    elif st.session_state.page == "إدارة المستخدمين":
+        display_user_management()
 
 # --- التطبيق الرئيسي ---
 def main():

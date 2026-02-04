@@ -423,7 +423,3 @@ button[kind="secondary"] {
     box-shadow: 0 4px 8px rgba(76, 175, 80, 0.3) !important;
 }
 
-/* إخفاء التذييل (Made with Streamlit) */
-footer {
-    visibility: hidden;
-}

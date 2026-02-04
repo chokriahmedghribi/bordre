@@ -14,7 +14,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 st.set_page_config(
-    page_title="نظام مكتب النظام - معهد حي الأمل بقابس",
+    page_title="المدرسة الإعدادية حي الامل قابس - مكتب الضبط",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -46,6 +46,10 @@ if 'show_contact_form' not in st.session_state:
     st.session_state.show_contact_form = False
 if 'selected_mail_for_bordereau' not in st.session_state:
     st.session_state.selected_mail_for_bordereau = None
+if 'bordereau_data' not in st.session_state:
+    st.session_state.bordereau_data = None
+if 'bordereau_buffer' not in st.session_state:
+    st.session_state.bordereau_buffer = None
 
 # --- نظام المصادقة ---
 def authenticate_user(username, password):
@@ -406,8 +410,8 @@ def login_screen():
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.markdown('<div class="institution-title">معهد حي الأمل بقابس</div>', unsafe_allow_html=True)
-        st.markdown('<div class="system-title">نظام مكتب النظام</div>', unsafe_allow_html=True)
+        st.markdown('<div class="institution-title">المدرسة الإعدادية حي الأمل   </div>', unsafe_allow_html=True)
+        st.markdown('<div class="system-title">مكتب الضبط  </div>', unsafe_allow_html=True)
         
         st.markdown('<p style="text-align: center; color: #666; margin-bottom: 30px;">الرجاء تسجيل الدخول للوصول إلى النظام</p>', unsafe_allow_html=True)
         
@@ -1153,50 +1157,6 @@ def edit_outgoing_mail(mail_id):
                                     type=['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png'],
                                     accept_multiple_files=True)
         
-        # زر إنشاء البوردرية
-        if st.button("📄 إنشاء/تحديث البوردرية"):
-            if recipient_id:
-                contact_info = get_contact_by_id(recipient_id)
-                mail_context = {
-                    'reference_no': reference_no,
-                    'sent_date': sent_date.strftime('%Y-%m-%d'),
-                    'recipient_name': recipient_name,
-                    'subject': subject,
-                    'notes': notes
-                }
-                
-                buffer = generate_bordereau_for_mail(mail_context, contact_info)
-                
-                if buffer:
-                    # زر تحميل البوردرية
-                    st.download_button(
-                        label="📥 تحميل البوردرية",
-                        data=buffer,
-                        file_name=f"بوردرية_{reference_no}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-                    
-                    # حفظ البوردرية
-                    upload_dir = "uploads/bordereau"
-                    os.makedirs(upload_dir, exist_ok=True)
-                    bordereau_filename = f"بوردرية_{reference_no}.docx"
-                    bordereau_path = os.path.join(upload_dir, bordereau_filename)
-                    
-                    with open(bordereau_path, "wb") as f:
-                        f.write(buffer.getvalue())
-                    
-                    # تحديث قاعدة البيانات
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE outgoing_mail SET bordereau = ? WHERE id = ?", 
-                                 (bordereau_filename, mail_id))
-                    conn.commit()
-                    conn.close()
-                    
-                    st.success(f"✅ تم حفظ البوردرية للسجلات: {bordereau_filename}")
-            else:
-                st.error("❌ الرجاء اختيار المستلم أولاً")
-        
         col_save, col_cancel = st.columns(2)
         with col_save:
             submitted = st.form_submit_button("💾 حفظ التعديلات", use_container_width=True)
@@ -1399,7 +1359,7 @@ def show_bordereau_generator(mail_id=None):
     """
     st.markdown("### 📄 إنشاء بوردرية للبريد الصادر")
     
-    # قسم رفع القالب (اختياري - يمكن استخدام القالب الموجود)
+    # قسم معلومات القالب
     st.markdown("#### 1. معلومات القالب")
     if not os.path.exists("templates/bordereau_template.docx"):
         st.error("❌ قالب البوردرية غير موجود. الرجاء وضع القالب في: templates/bordereau_template.docx")
@@ -1434,122 +1394,150 @@ def show_bordereau_generator(mail_id=None):
         mail_data = {}
         contact_info = None
     
-    with st.form("bordereau_data_form"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            reference_no = st.text_input(
-                "رقم المرجع *",
-                value=mail_data.get('reference_no', generate_ref_no("outgoing")),
-                placeholder="مثال: ص-0001-01-2024"
-            )
-            
-            # جلب قائمة جهات الاتصال
-            contacts_df = get_contacts()
-            contact_names = ["--- اختر من جهات الاتصال ---"] + contacts_df['name'].tolist() if not contacts_df.empty else ["--- لا توجد جهات اتصال ---"]
-            
-            current_recipient = mail_data.get('recipient_name', '')
-            recipient_index = contact_names.index(current_recipient) if current_recipient in contact_names else 0
-            recipient_choice = st.selectbox(
-                "اختر المستلم *",
-                contact_names,
-                index=recipient_index
-            )
-            
-            if recipient_choice == "--- اختر من جهات الاتصال ---":
-                st.warning("الرجاء اختيار المستلم من قائمة جهات الاتصال")
-                recipient_name = ""
-                recipient_id = None
-            else:
-                recipient_name = recipient_choice
-                recipient_id = contacts_df[contacts_df['name'] == recipient_choice].iloc[0]['id'] if not contacts_df.empty else None
-                
-                # عرض معلومات جهة الاتصال
-                if recipient_id and not contact_info:
-                    contact_info = get_contact_by_id(recipient_id)
-            
-            subject = st.text_input(
-                "الموضوع *",
-                value=mail_data.get('subject', ''),
-                placeholder="موضوع البريد"
-            )
-        
-        with col2:
-            sent_date = st.date_input(
-                "تاريخ الإرسال *",
-                value=datetime.strptime(mail_data.get('sent_date', date.today().strftime('%Y-%m-%d')), '%Y-%m-%d').date() if mail_data.get('sent_date') else date.today()
-            )
-            
-            # عرض معلومات جهة الاتصال إذا كانت متوفرة
-            if contact_info:
-                st.info(f"""
-                **معلومات المستلم:**
-                - المؤسسة: {contact_info.get('organization', 'غير محدد')}
-                - الهاتف: {contact_info.get('phone', 'غير محدد')}
-                - البريد: {contact_info.get('email', 'غير محدد')}
-                """)
-        
-        notes = st.text_area(
-            "ملاحظات",
-            value=mail_data.get('notes', ''),
-            placeholder="أي ملاحظات إضافية...",
-            height=100
+    # إعداد حقول الإدخال
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        reference_no = st.text_input(
+            "رقم المرجع *",
+            value=mail_data.get('reference_no', generate_ref_no("outgoing")),
+            placeholder="مثال: ص-0001-01-2024",
+            key="bordereau_ref"
         )
         
-        submitted = st.form_submit_button("🔄 إنشاء البوردرية")
+        # جلب قائمة جهات الاتصال
+        contacts_df = get_contacts()
+        contact_names = ["--- اختر من جهات الاتصال ---"] + contacts_df['name'].tolist() if not contacts_df.empty else ["--- لا توجد جهات اتصال ---"]
         
-        if submitted:
-            if not reference_no or not recipient_name or not subject:
-                st.error("❌ الرجاء ملء جميع الحقول الإلزامية (*)")
-            elif recipient_choice == "--- اختر من جهات الاتصال ---":
-                st.error("❌ الرجاء اختيار المستلم من قائمة جهات الاتصال")
-            else:
-                # إعداد بيانات البريد
-                mail_context = {
+        current_recipient = mail_data.get('recipient_name', '')
+        recipient_index = contact_names.index(current_recipient) if current_recipient in contact_names else 0
+        recipient_choice = st.selectbox(
+            "اختر المستلم *",
+            contact_names,
+            index=recipient_index,
+            key="bordereau_recipient"
+        )
+        
+        if recipient_choice == "--- اختر من جهات الاتصال ---":
+            st.warning("الرجاء اختيار المستلم من قائمة جهات الاتصال")
+            recipient_name = ""
+            recipient_id = None
+        else:
+            recipient_name = recipient_choice
+            recipient_id = contacts_df[contacts_df['name'] == recipient_choice].iloc[0]['id'] if not contacts_df.empty else None
+            
+            # عرض معلومات جهة الاتصال
+            if recipient_id and not contact_info:
+                contact_info = get_contact_by_id(recipient_id)
+        
+        subject = st.text_input(
+            "الموضوع *",
+            value=mail_data.get('subject', ''),
+            placeholder="موضوع البريد",
+            key="bordereau_subject"
+        )
+    
+    with col2:
+        sent_date = st.date_input(
+            "تاريخ الإرسال *",
+            value=datetime.strptime(mail_data.get('sent_date', date.today().strftime('%Y-%m-%d')), '%Y-%m-%d').date() if mail_data.get('sent_date') else date.today(),
+            key="bordereau_date"
+        )
+        
+        # عرض معلومات جهة الاتصال إذا كانت متوفرة
+        if contact_info:
+            st.info(f"""
+            **معلومات المستلم:**
+            - المؤسسة: {contact_info.get('organization', 'غير محدد')}
+            - الهاتف: {contact_info.get('phone', 'غير محدد')}
+            - البريد: {contact_info.get('email', 'غير محدد')}
+            """)
+    
+    notes = st.text_area(
+        "ملاحظات",
+        value=mail_data.get('notes', ''),
+        placeholder="أي ملاحظات إضافية...",
+        height=100,
+        key="bordereau_notes"
+    )
+    
+    # زر إنشاء البوردرية (خارج النموذج)
+    if st.button("🔄 إنشاء البوردرية", key="generate_bordereau_btn"):
+        if not reference_no or not recipient_name or not subject:
+            st.error("❌ الرجاء ملء جميع الحقول الإلزامية (*)")
+        elif recipient_choice == "--- اختر من جهات الاتصال ---":
+            st.error("❌ الرجاء اختيار المستلم من قائمة جهات الاتصال")
+        else:
+            # إعداد بيانات البريد
+            mail_context = {
+                'reference_no': reference_no,
+                'sent_date': sent_date.strftime('%Y-%m-%d'),
+                'recipient_name': recipient_name,
+                'subject': subject,
+                'notes': notes
+            }
+            
+            # إنشاء البوردرية
+            buffer = generate_bordereau_for_mail(mail_context, contact_info)
+            
+            if buffer:
+                # حفظ البوردرية في حالة الجلسة
+                st.session_state.bordereau_buffer = buffer
+                st.session_state.bordereau_data = {
                     'reference_no': reference_no,
                     'sent_date': sent_date.strftime('%Y-%m-%d'),
                     'recipient_name': recipient_name,
                     'subject': subject,
-                    'notes': notes
+                    'notes': notes,
+                    'mail_id': mail_id,
+                    'recipient_id': recipient_id
                 }
-                
-                # إنشاء البوردرية
-                buffer = generate_bordereau_for_mail(mail_context, contact_info)
-                
-                if buffer:
-                    # زر تحميل البوردرية
-                    st.success("✅ تم إنشاء البوردرية بنجاح!")
+                st.success("✅ تم إنشاء البوردرية بنجاح!")
+    
+    # عرض زر التحميل إذا كان هناك بوردرية جاهزة
+    if st.session_state.bordereau_buffer:
+        st.markdown("---")
+        st.markdown("#### 3. تحميل البوردرية")
+        
+        bordereau_data = st.session_state.bordereau_data
+        if bordereau_data:
+            st.download_button(
+                label="📥 تحميل البوردرية",
+                data=st.session_state.bordereau_buffer,
+                file_name=f"بوردرية_{bordereau_data['reference_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="download_bordereau"
+            )
+            
+            # إذا كان هناك بريد محدد، حفظ البوردرية في قاعدة البيانات
+            if bordereau_data['mail_id'] and bordereau_data['recipient_id']:
+                if st.button("💾 حفظ البوردرية للسجلات", key="save_bordereau_record"):
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
                     
-                    st.download_button(
-                        label="📥 تحميل البوردرية",
-                        data=buffer,
-                        file_name=f"بوردرية_{reference_no}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    # حفظ البوردرية
+                    upload_dir = "uploads/bordereau"
+                    os.makedirs(upload_dir, exist_ok=True)
+                    bordereau_filename = f"بوردرية_{bordereau_data['reference_no']}.docx"
+                    bordereau_path = os.path.join(upload_dir, bordereau_filename)
+                    
+                    with open(bordereau_path, "wb") as f:
+                        f.write(st.session_state.bordereau_buffer.getvalue())
+                    
+                    # تحديث قاعدة البيانات
+                    cursor.execute(
+                        "UPDATE outgoing_mail SET bordereau = ? WHERE id = ?",
+                        (bordereau_filename, bordereau_data['mail_id'])
                     )
+                    conn.commit()
+                    conn.close()
                     
-                    # إذا كان هناك بريد محدد، تحديث قاعدة البيانات
-                    if mail_id and recipient_id:
-                        conn = get_db_connection()
-                        cursor = conn.cursor()
-                        
-                        # حفظ البوردرية
-                        upload_dir = "uploads/bordereau"
-                        os.makedirs(upload_dir, exist_ok=True)
-                        bordereau_filename = f"بوردرية_{reference_no}.docx"
-                        bordereau_path = os.path.join(upload_dir, bordereau_filename)
-                        
-                        with open(bordereau_path, "wb") as f:
-                            f.write(buffer.getvalue())
-                        
-                        # تحديث قاعدة البيانات
-                        cursor.execute(
-                            "UPDATE outgoing_mail SET bordereau = ? WHERE id = ?",
-                            (bordereau_filename, mail_id)
-                        )
-                        conn.commit()
-                        conn.close()
-                        
-                        st.success(f"✅ تم حفظ البوردرية للسجلات: {bordereau_filename}")
+                    st.success(f"✅ تم حفظ البوردرية للسجلات: {bordereau_filename}")
+                    
+                    # إعادة تعيين الحالة
+                    st.session_state.bordereau_buffer = None
+                    st.session_state.bordereau_data = None
+                    st.rerun()
 
 def display_contacts():
     """عرض وإدارة جهات الاتصال"""
@@ -1676,8 +1664,8 @@ def main_interface():
         </style>
         """, unsafe_allow_html=True)
         
-        st.markdown('<div class="sidebar-title">معهد حي الأمل بقابس</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-subtitle">نظام مكتب النظام</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-title">المدرسة الإعدادية حي الأمل </div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-subtitle">مكتب الضبط </div>', unsafe_allow_html=True)
         
         st.markdown("---")
         

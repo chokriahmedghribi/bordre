@@ -1,20 +1,20 @@
 # إطار العمل الأساسي
-streamlit==1.28.1
+streamlit
 
 # معالجة البيانات
-pandas==2.1.3
-numpy==1.24.3
+pandas
+numpy
 
 # مستندات Word
-python-docx==0.8.11
-docxtpl==0.16.7
+python-docx
+docxtpl
 
 # ملفات Excel
-openpyxl==3.1.2
+openpyxl
 
 # قواعد البيانات (مدمج مع Python)
 # sqlite3
 
 # مكتبات إضافية
-pillow==10.1.0  # لمعالجة الصور
-python-dateutil==2.8.2  # لمعالجة التواريخ
+pillow
+python-dateutil

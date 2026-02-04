@@ -526,6 +526,772 @@ def generate_bordereau_for_mail(mail_data, contact_info=None):
         st.error(f"❌ خطأ في إنشاء البوردرية: {str(e)}")
         return None
 
+# --- وظائف تعديل البريد ---
+def edit_incoming_mail(mail_id):
+    """تعديل بريد وارد"""
+    if not check_permission('edit'):
+        st.warning("⚠️ ليس لديك صلاحية لتعديل البريد الوارد")
+        st.session_state.edit_mail_id = None
+        st.session_state.edit_mail_type = None
+        st.rerun()
+        return
+    
+    st.markdown('<div class="card"><h3>تعديل البريد الوارد</h3></div>', unsafe_allow_html=True)
+    
+    # جلب بيانات البريد
+    mail_data = get_mail_by_id(mail_id, "incoming")
+    
+    if not mail_data:
+        st.error("❌ لم يتم العثور على البريد المطلوب")
+        st.button("← العودة", on_click=lambda: [setattr(st.session_state, 'edit_mail_id', None), 
+                                                 setattr(st.session_state, 'edit_mail_type', None), 
+                                                 st.rerun()])
+        return
+    
+    # جلب قائمة جهات الاتصال
+    contacts_df = get_contacts()
+    
+    with st.form("edit_incoming_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            reference_no = st.text_input("رقم المرجع *", value=mail_data.get('reference_no', ''))
+            
+            # الحصول على المرسل الحالي
+            current_sender = mail_data.get('sender_name', '')
+            sender_options = ["--- اختر من جهات الاتصال ---"]
+            
+            if not contacts_df.empty:
+                for _, row in contacts_df.iterrows():
+                    display_text = f"{row['name']}"
+                    if row['organization']:
+                        display_text += f" - {row['organization']}"
+                    sender_options.append(display_text)
+            
+            # تحديد اختيار المرسل
+            sender_display = current_sender
+            if mail_data.get('sender_id'):
+                contact_info = get_contact_by_id(mail_data['sender_id'])
+                if contact_info:
+                    sender_display = f"{contact_info['name']} - {contact_info.get('organization', '')}"
+            
+            sender_choice = st.selectbox(
+                "المرسل *",
+                options=sender_options,
+                index=0,
+                help="اختر المرسل من قائمة جهات الاتصال"
+            )
+            
+            if sender_choice == "--- اختر من جهات الاتصال ---":
+                sender_name = mail_data.get('sender_name', '')
+                sender_id = mail_data.get('sender_id')
+            else:
+                # استخراج اسم المرسل من الاختيار
+                sender_parts = sender_choice.split(' - ')
+                sender_name = sender_parts[0]
+                # البحث عن ID في قاعدة البيانات
+                matched = contacts_df[contacts_df['name'] == sender_name]
+                if not matched.empty:
+                    sender_id = matched.iloc[0]['id']
+                else:
+                    sender_id = None
+            
+            subject = st.text_input("الموضوع *", value=mail_data.get('subject', ''))
+        
+        with col2:
+            received_date = st.date_input("تاريخ الاستلام", 
+                                        value=datetime.strptime(mail_data.get('received_date', date.today().strftime('%Y-%m-%d')), '%Y-%m-%d').date())
+            priority = st.selectbox("الأولوية", ["عادي", "مهم", "عاجل"], 
+                                  index=["عادي", "مهم", "عاجل"].index(mail_data.get('priority', 'عادي')))
+            status = st.selectbox("الحالة", ["جديد", "قيد المعالجة", "مكتمل", "ملغي"], 
+                                index=["جديد", "قيد المعالجة", "مكتمل", "ملغي"].index(mail_data.get('status', 'جديد')))
+            category = st.selectbox("التصنيف", ["إداري", "مالي", "فني", "قانوني", "أخرى"], 
+                                  index=["إداري", "مالي", "فني", "قانوني", "أخرى"].index(mail_data.get('category', 'إداري')))
+        
+        # تاريخ الاستحقاق
+        due_date_val = mail_data.get('due_date')
+        if due_date_val:
+            try:
+                due_date_val = datetime.strptime(due_date_val, '%Y-%m-%d').date()
+            except:
+                due_date_val = None
+        
+        col_due1, col_due2 = st.columns([1, 2])
+        with col_due1:
+            has_due_date = st.checkbox("تحديد تاريخ استحقاق", value=bool(due_date_val))
+        
+        with col_due2:
+            if has_due_date:
+                due_date = st.date_input("تاريخ الاستحقاق", value=due_date_val or (date.today() + timedelta(days=7)))
+            else:
+                due_date = None
+        
+        content = st.text_area("محتوى الرسالة", value=mail_data.get('content', ''), height=150)
+        notes = st.text_area("ملاحظات إضافية", value=mail_data.get('notes', ''), height=100)
+        
+        # عرض المرفقات الحالية
+        current_attachments = get_attachment_list(mail_data.get('attachments'))
+        if current_attachments:
+            st.markdown("#### 📎 المرفقات الحالية")
+            for attachment in current_attachments:
+                st.markdown(f"- {attachment}")
+        
+        # إضافة مرفقات جديدة
+        st.markdown("#### 📎 إضافة مرفقات جديدة")
+        uploaded_files = st.file_uploader(
+            "إرفاق مستندات جديدة", 
+            type=['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png', 'txt'],
+            accept_multiple_files=True,
+            help="يمكنك رفع أكثر من ملف"
+        )
+        
+        col_save, col_cancel = st.columns(2)
+        with col_save:
+            save_changes = st.form_submit_button("💾 حفظ التعديلات", use_container_width=True)
+        
+        with col_cancel:
+            if st.form_submit_button("إلغاء", use_container_width=True):
+                st.session_state.edit_mail_id = None
+                st.session_state.edit_mail_type = None
+                st.rerun()
+        
+        if save_changes:
+            if not sender_name or not subject:
+                st.error("الرجاء ملء الحقول الإلزامية (*)")
+            else:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                try:
+                    # حفظ المرفقات الجديدة
+                    new_attachments = current_attachments.copy() if current_attachments else []
+                    if uploaded_files:
+                        for file in uploaded_files:
+                            filepath = save_uploaded_file(file, "incoming")
+                            if filepath:
+                                new_attachments.append(os.path.basename(filepath))
+                    
+                    # تحديث البريد الوارد
+                    cursor.execute('''
+                    UPDATE incoming_mail 
+                    SET reference_no = ?, sender_id = ?, sender_name = ?, subject = ?, 
+                        content = ?, received_date = ?, priority = ?, status = ?, 
+                        category = ?, due_date = ?, attachments = ?, notes = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    ''', (
+                        reference_no,
+                        sender_id,
+                        sender_name,
+                        subject,
+                        content,
+                        received_date.strftime('%Y-%m-%d'),
+                        priority,
+                        status,
+                        category,
+                        due_date.strftime('%Y-%m-%d') if due_date else None,
+                        json.dumps(new_attachments) if new_attachments else None,
+                        notes,
+                        mail_id
+                    ))
+                    
+                    conn.commit()
+                    log_activity(st.session_state.user['id'], "تعديل بريد وارد", 
+                               f"رقم المرجع: {reference_no}")
+                    
+                    st.success("✅ تم تحديث البريد الوارد بنجاح!")
+                    
+                    # تأخير لإظهار الرسالة ثم العودة
+                    st.rerun()
+                    
+                except sqlite3.IntegrityError:
+                    st.error(f"❌ رقم المرجع '{reference_no}' موجود مسبقاً لبريد آخر!")
+                except Exception as e:
+                    st.error(f"❌ خطأ في التحديث: {str(e)}")
+                finally:
+                    conn.close()
+
+def edit_outgoing_mail(mail_id):
+    """تعديل بريد صادر"""
+    if not check_permission('edit'):
+        st.warning("⚠️ ليس لديك صلاحية لتعديل البريد الصادر")
+        st.session_state.edit_mail_id = None
+        st.session_state.edit_mail_type = None
+        st.rerun()
+        return
+    
+    st.markdown('<div class="card"><h3>تعديل البريد الصادر</h3></div>', unsafe_allow_html=True)
+    
+    # جلب بيانات البريد
+    mail_data = get_mail_by_id(mail_id, "outgoing")
+    
+    if not mail_data:
+        st.error("❌ لم يتم العثور على البريد المطلوب")
+        st.button("← العودة", on_click=lambda: [setattr(st.session_state, 'edit_mail_id', None), 
+                                                 setattr(st.session_state, 'edit_mail_type', None), 
+                                                 st.rerun()])
+        return
+    
+    # جلب قائمة جهات الاتصال
+    contacts_df = get_contacts()
+    contact_names = ["--- اختر من جهات الاتصال ---"] + contacts_df['name'].tolist() if not contacts_df.empty else ["--- لا توجد جهات اتصال ---"]
+    
+    with st.form("edit_outgoing_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            reference_no = st.text_input("رقم المرجع *", value=mail_data.get('reference_no', ''))
+            
+            # تحديد المستلم الحالي
+            current_recipient = mail_data.get('recipient_name', '')
+            if current_recipient in contact_names:
+                recipient_index = contact_names.index(current_recipient)
+            else:
+                recipient_index = 0
+            
+            recipient_choice = st.selectbox("المستلم *", contact_names, index=recipient_index)
+            
+            if recipient_choice == "--- اختر من جهات الاتصال ---":
+                st.warning("الرجاء اختيار المستلم من القائمة")
+                recipient_name = current_recipient
+                recipient_id = mail_data.get('recipient_id')
+            else:
+                recipient_name = recipient_choice
+                recipient_id = contacts_df[contacts_df['name'] == recipient_choice].iloc[0]['id'] if not contacts_df.empty else None
+            
+            subject = st.text_input("الموضوع *", value=mail_data.get('subject', ''))
+        
+        with col2:
+            priority = st.selectbox("الأولوية", ["عادي", "مهم", "عاجل"], 
+                                  index=["عادي", "مهم", "عاجل"].index(mail_data.get('priority', 'عادي')))
+            status = st.selectbox("الحالة", ["مسودة", "مرسل", "مؤرشف"], 
+                                index=["مسودة", "مرسل", "مؤرشف"].index(mail_data.get('status', 'مسودة')))
+            category = st.selectbox("التصنيف", ["إداري", "مالي", "فني", "قانوني", "أخرى"], 
+                                  index=["إداري", "مالي", "فني", "قانوني", "أخرى"].index(mail_data.get('category', 'إداري')))
+            
+            sent_date_val = mail_data.get('sent_date', date.today().strftime('%Y-%m-%d'))
+            sent_date = st.date_input("تاريخ الإرسال", 
+                                     value=datetime.strptime(sent_date_val, '%Y-%m-%d').date())
+        
+        content = st.text_area("محتوى الرسالة", value=mail_data.get('content', ''), height=200)
+        notes = st.text_area("ملاحظات إضافية", value=mail_data.get('notes', ''), height=100)
+        
+        # عرض المرفقات الحالية
+        current_attachments = get_attachment_list(mail_data.get('attachments'))
+        if current_attachments:
+            st.markdown("#### 📎 المرفقات الحالية")
+            for attachment in current_attachments:
+                st.markdown(f"- {attachment}")
+        
+        # إضافة مرفقات جديدة
+        st.markdown("#### 📎 إضافة مرفقات جديدة")
+        uploaded_files = st.file_uploader(
+            "إرفاق مستندات جديدة", 
+            type=['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png'],
+            accept_multiple_files=True,
+            help="يمكنك رفع أكثر من ملف"
+        )
+        
+        col_save, col_cancel = st.columns(2)
+        with col_save:
+            save_changes = st.form_submit_button("💾 حفظ التعديلات", use_container_width=True)
+        
+        with col_cancel:
+            if st.form_submit_button("إلغاء", use_container_width=True):
+                st.session_state.edit_mail_id = None
+                st.session_state.edit_mail_type = None
+                st.rerun()
+        
+        if save_changes:
+            if not recipient_name or not subject:
+                st.error("الرجاء ملء الحقول الإلزامية (*)")
+            elif recipient_choice == "--- اختر من جهات الاتصال ---":
+                st.error("الرجاء اختيار المستلم من قائمة جهات الاتصال")
+            else:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                try:
+                    # حفظ المرفقات الجديدة
+                    new_attachments = current_attachments.copy() if current_attachments else []
+                    if uploaded_files:
+                        for file in uploaded_files:
+                            filepath = save_uploaded_file(file, "outgoing")
+                            if filepath:
+                                new_attachments.append(os.path.basename(filepath))
+                    
+                    # التحقق إذا تم تغيير الحالة إلى "مرسل" وإنشاء بوردرية
+                    bordereau_filename = mail_data.get('bordereau')
+                    if status == "مرسل" and mail_data.get('status') != "مرسل" and recipient_id:
+                        # إنشاء بوردرية جديدة
+                        contact_info = get_contact_by_id(recipient_id)
+                        mail_context = {
+                            'reference_no': reference_no,
+                            'sent_date': sent_date.strftime('%Y-%m-%d'),
+                            'recipient_name': recipient_name,
+                            'subject': subject,
+                            'notes': notes
+                        }
+                        
+                        buffer = generate_bordereau_for_mail(mail_context, contact_info)
+                        
+                        if buffer:
+                            upload_dir = "uploads/bordereau"
+                            os.makedirs(upload_dir, exist_ok=True)
+                            bordereau_filename = f"بوردرية_{reference_no}.docx"
+                            bordereau_path = os.path.join(upload_dir, bordereau_filename)
+                            
+                            with open(bordereau_path, "wb") as f:
+                                f.write(buffer.getvalue())
+                            st.success("✅ تم إنشاء بوردرية جديدة!")
+                    
+                    # تحديث البريد الصادر
+                    cursor.execute('''
+                    UPDATE outgoing_mail 
+                    SET reference_no = ?, recipient_id = ?, recipient_name = ?, subject = ?, 
+                        content = ?, priority = ?, status = ?, sent_date = ?, 
+                        category = ?, attachments = ?, bordereau = ?, notes = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    ''', (
+                        reference_no,
+                        recipient_id,
+                        recipient_name,
+                        subject,
+                        content,
+                        priority,
+                        status,
+                        sent_date.strftime('%Y-%m-%d'),
+                        category,
+                        json.dumps(new_attachments) if new_attachments else None,
+                        bordereau_filename,
+                        notes,
+                        mail_id
+                    ))
+                    
+                    conn.commit()
+                    log_activity(st.session_state.user['id'], "تعديل بريد صادر", 
+                               f"رقم المرجع: {reference_no}")
+                    
+                    st.success("✅ تم تحديث البريد الصادر بنجاح!")
+                    st.rerun()
+                    
+                except sqlite3.IntegrityError:
+                    st.error(f"❌ رقم المرجع '{reference_no}' موجود مسبقاً لبريد آخر!")
+                except Exception as e:
+                    st.error(f"❌ خطأ في التحديث: {str(e)}")
+                finally:
+                    conn.close()
+
+def view_mail_details(mail_id, mail_type):
+    """عرض تفاصيل البريد"""
+    st.markdown('<div class="card"><h3>تفاصيل البريد</h3></div>', unsafe_allow_html=True)
+    
+    # جلب بيانات البريد
+    mail_data = get_mail_by_id(mail_id, mail_type)
+    
+    if not mail_data:
+        st.error("❌ لم يتم العثور على البريد المطلوب")
+        st.button("← العودة", on_click=lambda: [setattr(st.session_state, 'view_mail_id', None), 
+                                                 setattr(st.session_state, 'view_mail_type', None), 
+                                                 st.rerun()])
+        return
+    
+    # زر العودة
+    if st.button("← العودة"):
+        st.session_state.view_mail_id = None
+        st.session_state.view_mail_type = None
+        st.rerun()
+    
+    if mail_type == "incoming":
+        display_incoming_details(mail_data)
+    else:
+        display_outgoing_details(mail_data)
+    
+    # زر التعديل (إذا كان لدى المستخدم الصلاحية)
+    if check_permission('edit'):
+        if st.button("✏️ تعديل", use_container_width=True):
+            st.session_state.edit_mail_id = mail_id
+            st.session_state.edit_mail_type = mail_type
+            st.session_state.view_mail_id = None
+            st.session_state.view_mail_type = None
+            st.rerun()
+
+def display_incoming_details(mail_data):
+    """عرض تفاصيل البريد الوارد"""
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### المعلومات الأساسية")
+        st.markdown(f"**رقم المرجع:** {mail_data.get('reference_no', 'غير محدد')}")
+        st.markdown(f"**المرسل:** {mail_data.get('sender_name', 'غير محدد')}")
+        st.markdown(f"**الموضوع:** {mail_data.get('subject', 'غير محدد')}")
+        st.markdown(f"**تاريخ الاستلام:** {mail_data.get('received_date', 'غير محدد')}")
+        
+        if mail_data.get('due_date'):
+            st.markdown(f"**تاريخ الاستحقاق:** {mail_data.get('due_date')}")
+            try:
+                due_date = datetime.strptime(mail_data['due_date'], '%Y-%m-%d').date()
+                days_left = (due_date - date.today()).days
+                if days_left < 0:
+                    st.error(f"⏰ تجاوز تاريخ الاستحقاق ب {abs(days_left)} يوم")
+                elif days_left <= 3:
+                    st.warning(f"⏰ متبقي {days_left} يوم للاستحقاق")
+            except:
+                pass
+    
+    with col2:
+        st.markdown("### المعلومات الإضافية")
+        st.markdown(f"**الأولوية:** {mail_data.get('priority', 'غير محدد')}")
+        st.markdown(f"**الحالة:** {mail_data.get('status', 'غير محدد')}")
+        st.markdown(f"**التصنيف:** {mail_data.get('category', 'غير محدد')}")
+        st.markdown(f"**مسجل بواسطة:** {mail_data.get('recorded_by', 'غير محدد')}")
+    
+    # المحتوى
+    st.markdown("### محتوى الرسالة")
+    st.markdown(f"<div style='background-color: #f8f9fa; padding: 15px; border-radius: 5px;'>{mail_data.get('content', 'لا يوجد محتوى')}</div>", 
+                unsafe_allow_html=True)
+    
+    if mail_data.get('notes'):
+        st.markdown("### ملاحظات إضافية")
+        st.markdown(f"<div style='background-color: #fff3cd; padding: 15px; border-radius: 5px;'>{mail_data.get('notes')}</div>", 
+                    unsafe_allow_html=True)
+    
+    # المرفقات
+    attachments = get_attachment_list(mail_data.get('attachments'))
+    if attachments:
+        st.markdown("### 📎 المرفقات")
+        for attachment in attachments:
+            st.markdown(f"- {attachment}")
+
+def display_outgoing_details(mail_data):
+    """عرض تفاصيل البريد الصادر"""
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### المعلومات الأساسية")
+        st.markdown(f"**رقم المرجع:** {mail_data.get('reference_no', 'غير محدد')}")
+        st.markdown(f"**المستلم:** {mail_data.get('recipient_name', 'غير محدد')}")
+        st.markdown(f"**الموضوع:** {mail_data.get('subject', 'غير محدد')}")
+        st.markdown(f"**تاريخ الإرسال:** {mail_data.get('sent_date', 'غير محدد')}")
+    
+    with col2:
+        st.markdown("### المعلومات الإضافية")
+        st.markdown(f"**الأولوية:** {mail_data.get('priority', 'غير محدد')}")
+        st.markdown(f"**الحالة:** {mail_data.get('status', 'غير محدد')}")
+        st.markdown(f"**التصنيف:** {mail_data.get('category', 'غير محدد')}")
+        st.markdown(f"**مرسل بواسطة:** {mail_data.get('sent_by', 'غير محدد')}")
+    
+    # المحتوى
+    st.markdown("### محتوى الرسالة")
+    st.markdown(f"<div style='background-color: #f8f9fa; padding: 15px; border-radius: 5px;'>{mail_data.get('content', 'لا يوجد محتوى')}</div>", 
+                unsafe_allow_html=True)
+    
+    if mail_data.get('notes'):
+        st.markdown("### ملاحظات إضافية")
+        st.markdown(f"<div style='background-color: #fff3cd; padding: 15px; border-radius: 5px;'>{mail_data.get('notes')}</div>", 
+                    unsafe_allow_html=True)
+    
+    # المرفقات
+    attachments = get_attachment_list(mail_data.get('attachments'))
+    if attachments:
+        st.markdown("### 📎 المرفقات")
+        for attachment in attachments:
+            st.markdown(f"- {attachment}")
+    
+    # البوردرية
+    if mail_data.get('bordereau'):
+        st.markdown("### 📄 البوردرية")
+        bordereau_path = f"uploads/bordereau/{mail_data['bordereau']}"
+        if os.path.exists(bordereau_path):
+            with open(bordereau_path, "rb") as f:
+                bordereau_bytes = f.read()
+            
+            st.download_button(
+                label="📥 تحميل البوردرية",
+                data=bordereau_bytes,
+                file_name=mail_data['bordereau'],
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+        else:
+            st.warning("ملف البوردرية غير موجود")
+
+# --- وظيفة إنشاء البوردرية من صفحة مخصصة ---
+def display_bordereau_generator():
+    """عرض واجهة إنشاء البوردرية"""
+    st.markdown('<div class="card"><h3>إنشاء بوردرية</h3></div>', unsafe_allow_html=True)
+    
+    # خيارات إنشاء البوردرية
+    create_option = st.radio(
+        "اختر طريقة إنشاء البوردرية:",
+        ["إنشاء بوردرية جديدة", "إنشاء بوردرية من بريد صادر موجود"]
+    )
+    
+    if create_option == "إنشاء بوردرية جديدة":
+        create_new_bordereau()
+    else:
+        create_bordereau_from_existing_mail()
+
+def create_new_bordereau():
+    """إنشاء بوردرية جديدة من البيانات المدخلة"""
+    st.markdown("### إنشاء بوردرية جديدة")
+    
+    with st.form("new_bordereau_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            reference_no = st.text_input("رقم المرجع *", placeholder="مثال: ص-0001-01-2024")
+            sent_date = st.date_input("تاريخ الإرسال *", value=date.today())
+            recipient_name = st.text_input("اسم المستلم *", placeholder="الاسم الكامل")
+            organization = st.text_input("المؤسسة", placeholder="اسم المؤسسة")
+        
+        with col2:
+            phone = st.text_input("الهاتف", placeholder="رقم الهاتف")
+            email = st.text_input("البريد الإلكتروني", placeholder="example@domain.com")
+            subject = st.text_input("الموضوع *", placeholder="موضوع الرسالة")
+        
+        notes = st.text_area("ملاحظات", height=100, placeholder="ملاحظات إضافية...")
+        
+        submitted = st.form_submit_button("📄 إنشاء البوردرية", use_container_width=True)
+        
+        if submitted:
+            if not reference_no or not recipient_name or not subject:
+                st.error("الرجاء ملء الحقول الإلزامية (*)")
+            else:
+                # تحضير البيانات
+                mail_data = {
+                    'reference_no': reference_no,
+                    'sent_date': sent_date.strftime('%Y-%m-%d'),
+                    'recipient_name': recipient_name,
+                    'subject': subject,
+                    'notes': notes
+                }
+                
+                contact_info = {
+                    'organization': organization,
+                    'phone': phone,
+                    'email': email
+                }
+                
+                # إنشاء البوردرية
+                buffer = generate_bordereau_for_mail(mail_data, contact_info)
+                
+                if buffer:
+                    st.session_state.bordereau_buffer = buffer
+                    st.session_state.bordereau_data = {
+                        'reference_no': reference_no,
+                        'filename': f"بوردرية_{reference_no}.docx"
+                    }
+                    
+                    st.success("✅ تم إنشاء البوردرية بنجاح!")
+                    
+                    # عرض زر التحميل
+                    st.download_button(
+                        label="📥 تحميل البوردرية",
+                        data=buffer.getvalue(),
+                        file_name=f"بوردرية_{reference_no}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+                    
+                    # زر حفظ في النظام
+                    if st.button("💾 حفظ البوردرية في النظام", use_container_width=True):
+                        save_bordereau_to_system(reference_no, buffer)
+
+def create_bordereau_from_existing_mail():
+    """إنشاء بوردرية من بريد صادر موجود"""
+    st.markdown("### إنشاء بوردرية من بريد صادر")
+    
+    # جلب البريد الصادر
+    conn = get_db_connection()
+    try:
+        outgoing_df = pd.read_sql("""
+            SELECT id, reference_no, recipient_name, subject, sent_date, status
+            FROM outgoing_mail 
+            WHERE status IN ('مسودة', 'مرسل')
+            ORDER BY sent_date DESC
+        """, conn)
+    except:
+        outgoing_df = pd.DataFrame()
+    finally:
+        conn.close()
+    
+    if not outgoing_df.empty:
+        # اختيار البريد
+        mail_options = []
+        for _, row in outgoing_df.iterrows():
+            display_text = f"{row['reference_no']} - {row['recipient_name']} - {row['subject']}"
+            if len(display_text) > 80:
+                display_text = display_text[:77] + "..."
+            mail_options.append((row['id'], display_text))
+        
+        selected_mail_display = st.selectbox(
+            "اختر بريداً صادراً",
+            options=[display for _, display in mail_options],
+            format_func=lambda x: x
+        )
+        
+        if selected_mail_display:
+            # الحصول على ID المحدد
+            selected_id = None
+            for mail_id, display in mail_options:
+                if display == selected_mail_display:
+                    selected_id = mail_id
+                    break
+            
+            if selected_id:
+                mail_data = get_mail_by_id(selected_id, "outgoing")
+                
+                if mail_data:
+                    st.markdown("#### معلومات البريد المحدد")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.info(f"**رقم المرجع:** {mail_data.get('reference_no')}")
+                        st.info(f"**المستلم:** {mail_data.get('recipient_name')}")
+                        st.info(f"**الموضوع:** {mail_data.get('subject')}")
+                    
+                    with col2:
+                        st.info(f"**تاريخ الإرسال:** {mail_data.get('sent_date')}")
+                        st.info(f"**الحالة:** {mail_data.get('status')}")
+                    
+                    # جلب معلومات جهة الاتصال
+                    contact_info = None
+                    if mail_data.get('recipient_id'):
+                        contact_info = get_contact_by_id(mail_data['recipient_id'])
+                    
+                    if st.button("📄 إنشاء بوردرية", use_container_width=True):
+                        buffer = generate_bordereau_for_mail(mail_data, contact_info)
+                        
+                        if buffer:
+                            st.session_state.bordereau_buffer = buffer
+                            st.session_state.bordereau_data = {
+                                'reference_no': mail_data.get('reference_no'),
+                                'filename': f"بوردرية_{mail_data.get('reference_no')}.docx"
+                            }
+                            
+                            st.success("✅ تم إنشاء البوردرية بنجاح!")
+                            
+                            # عرض زر التحميل
+                            st.download_button(
+                                label="📥 تحميل البوردرية",
+                                data=buffer.getvalue(),
+                                file_name=f"بوردرية_{mail_data.get('reference_no')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                use_container_width=True
+                            )
+                            
+                            # تحديث البريد الصادر بملف البوردرية
+                            if st.button("💾 تحديث البريد بالبوردرية", use_container_width=True):
+                                conn = get_db_connection()
+                                cursor = conn.cursor()
+                                
+                                bordereau_filename = f"بوردرية_{mail_data.get('reference_no')}.docx"
+                                upload_dir = "uploads/bordereau"
+                                os.makedirs(upload_dir, exist_ok=True)
+                                bordereau_path = os.path.join(upload_dir, bordereau_filename)
+                                
+                                with open(bordereau_path, "wb") as f:
+                                    f.write(buffer.getvalue())
+                                
+                                cursor.execute('''
+                                UPDATE outgoing_mail 
+                                SET bordereau = ?
+                                WHERE id = ?
+                                ''', (bordereau_filename, selected_id))
+                                
+                                conn.commit()
+                                conn.close()
+                                
+                                log_activity(st.session_state.user['id'], "إضافة بوردرية", 
+                                           f"للبريد الصادر: {mail_data.get('reference_no')}")
+                                
+                                st.success("✅ تم تحديث البريد بملف البوردرية!")
+                else:
+                    st.warning("❌ لم يتم العثور على بيانات البريد المحدد")
+    else:
+        st.info("📭 لا توجد بريد صادر متاح لإنشاء بوردرية")
+
+def save_bordereau_to_system(reference_no, buffer):
+    """حفظ البوردرية في النظام"""
+    upload_dir = "uploads/bordereau"
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    filename = f"بوردرية_{reference_no}.docx"
+    filepath = os.path.join(upload_dir, filename)
+    
+    try:
+        with open(filepath, "wb") as f:
+            f.write(buffer.getvalue())
+        
+        log_activity(st.session_state.user['id'], "حفظ بوردرية", 
+                   f"البوردرية: {filename}")
+        
+        st.success(f"✅ تم حفظ البوردرية في: {filepath}")
+    except Exception as e:
+        st.error(f"❌ خطأ في حفظ البوردرية: {str(e)}")
+
+def show_incoming_stats():
+    """عرض إحصائيات البريد الوارد"""
+    conn = get_db_connection()
+    
+    try:
+        # إحصائيات حسب الحالة
+        status_stats = pd.read_sql("""
+            SELECT status as 'الحالة', COUNT(*) as 'العدد'
+            FROM incoming_mail
+            GROUP BY status
+            ORDER BY COUNT(*) DESC
+        """, conn)
+        
+        # إحصائيات حسب الأولوية
+        priority_stats = pd.read_sql("""
+            SELECT priority as 'الأولوية', COUNT(*) as 'العدد'
+            FROM incoming_mail
+            GROUP BY priority
+            ORDER BY COUNT(*) DESC
+        """, conn)
+        
+        # إحصائيات حسب التصنيف
+        category_stats = pd.read_sql("""
+            SELECT category as 'التصنيف', COUNT(*) as 'العدد'
+            FROM incoming_mail
+            GROUP BY category
+            ORDER BY COUNT(*) DESC
+        """, conn)
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("##### حسب الحالة")
+            st.dataframe(status_stats, use_container_width=True, hide_index=True)
+        
+        with col2:
+            st.markdown("##### حسب الأولوية")
+            st.dataframe(priority_stats, use_container_width=True, hide_index=True)
+        
+        with col3:
+            st.markdown("##### حسب التصنيف")
+            st.dataframe(category_stats, use_container_width=True, hide_index=True)
+        
+        # إحصائيات شهرية
+        monthly_stats = pd.read_sql("""
+            SELECT strftime('%Y-%m', received_date) as 'الشهر', COUNT(*) as 'عدد الرسائل'
+            FROM incoming_mail
+            GROUP BY strftime('%Y-%m', received_date)
+            ORDER BY strftime('%Y-%m', received_date) DESC
+            LIMIT 6
+        """, conn)
+        
+        if not monthly_stats.empty:
+            st.markdown("##### الإحصائيات الشهرية (آخر 6 أشهر)")
+            st.dataframe(monthly_stats, use_container_width=True, hide_index=True)
+        
+    except Exception as e:
+        st.error(f"خطأ في جلب الإحصائيات: {str(e)}")
+    finally:
+        conn.close()
+
 # --- وظائف تصدير إلى Excel ---
 def export_incoming_to_excel():
     """تصدير البريد الوارد إلى Excel"""
@@ -1200,37 +1966,133 @@ def register_incoming_mail():
     
     st.markdown('<div class="card"><h3>تسجيل بريد وارد جديد</h3></div>', unsafe_allow_html=True)
     
-    with st.form("incoming_mail_form"):
+    # جلب قائمة جهات الاتصال
+    contacts_df = get_contacts()
+    
+    # تحضير قائمة جهات الاتصال للـ selectbox
+    if not contacts_df.empty:
+        # إنشاء قائمة بعرض أكثر تفصيلاً
+        contact_options = ["--- اختر من جهات الاتصال ---"]
+        contact_display = []
+        
+        for _, row in contacts_df.iterrows():
+            display_text = f"{row['name']}"
+            if row['organization']:
+                display_text += f" - {row['organization']}"
+            contact_display.append(display_text)
+            contact_options.append(display_text)
+    else:
+        contact_display = []
+        contact_options = ["--- لا توجد جهات اتصال مسجلة ---"]
+    
+    with st.form("incoming_mail_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         
         with col1:
             reference_no = st.text_input("رقم المرجع", value=generate_ref_no("incoming"))
-            sender_name = st.text_input("اسم المرسل *", placeholder="اسم المرسل أو المؤسسة")
-            subject = st.text_input("الموضوع *", placeholder="موضوع الرسالة")
-            received_date = st.date_input("تاريخ الاستلام", value=date.today())
+            
+            # استخدام selectbox بدلاً من text input
+            contact_choice = st.selectbox(
+                "المرسل *", 
+                options=contact_options,
+                help="اختر المرسل من قائمة جهات الاتصال المسجلة"
+            )
+            
+            # استخراج اسم المرسل من الاختيار
+            if contact_choice == "--- اختر من جهات الاتصال ---":
+                st.warning("الرجاء اختيار المرسل من القائمة")
+                sender_name = ""
+                sender_id = None
+            elif contact_choice == "--- لا توجد جهات اتصال مسجلة ---":
+                st.error("❌ لا توجد جهات اتصال مسجلة. الرجاء إضافة جهات اتصال أولاً.")
+                sender_name = ""
+                sender_id = None
+            else:
+                # الحصول على ID واسم المرسل
+                contact_index = contact_display.index(contact_choice)
+                sender_row = contacts_df.iloc[contact_index]
+                sender_name = sender_row['name']
+                sender_id = sender_row['id']
+                
+                # عرض معلومات إضافية عن المرسل
+                with st.expander("معلومات المرسل", expanded=False):
+                    st.info(f"""
+                    **معلومات الجهة:**
+                    - **المؤسسة:** {sender_row.get('organization', 'غير محدد')}
+                    - **الهاتف:** {sender_row.get('phone', 'غير محدد')}
+                    - **البريد الإلكتروني:** {sender_row.get('email', 'غير محدد')}
+                    """)
+            
+            # خيار لإضافة مرسل جديد (ليس في القائمة)
+            add_new_sender = st.checkbox("إضافة مرسل جديد (غير موجود في القائمة)")
+            
+            if add_new_sender:
+                new_sender_name = st.text_input("اسم المرسل الجديد *", placeholder="أدخل اسم المرسل الجديد")
+                if new_sender_name:
+                    sender_name = new_sender_name
+                    sender_id = None
+                    st.success(f"✅ سيتم تسجيل المرسل الجديد: {new_sender_name}")
         
         with col2:
+            subject = st.text_input("الموضوع *", placeholder="موضوع الرسالة")
+            received_date = st.date_input("تاريخ الاستلام", value=date.today())
             priority = st.selectbox("الأولوية", ["عادي", "مهم", "عاجل"])
             category = st.selectbox("التصنيف", ["إداري", "مالي", "فني", "قانوني", "أخرى"])
-            due_date = st.date_input("تاريخ الاستحقاق (اختياري)", value=None)
+        
+        # حقل تاريخ الاستحقاق
+        col_due1, col_due2 = st.columns([1, 2])
+        with col_due1:
+            has_due_date = st.checkbox("تحديد تاريخ استحقاق")
+        
+        with col_due2:
+            if has_due_date:
+                due_date = st.date_input("تاريخ الاستحقاق", value=date.today() + timedelta(days=7))
+            else:
+                due_date = None
         
         content = st.text_area("محتوى الرسالة", height=150, placeholder="أدخل محتوى الرسالة...")
         notes = st.text_area("ملاحظات إضافية", height=100, placeholder="ملاحظات إضافية...")
         
-        uploaded_files = st.file_uploader("إرفاق مستندات", 
-                                        type=['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png'],
-                                        accept_multiple_files=True)
+        # المرفقات
+        st.markdown("#### 📎 المرفقات")
+        uploaded_files = st.file_uploader(
+            "إرفاق مستندات", 
+            type=['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png', 'txt'],
+            accept_multiple_files=True,
+            help="يمكنك رفع أكثر من ملف"
+        )
         
-        submitted = st.form_submit_button("💾 تسجيل البريد الوارد")
+        # ملخص الملفات المرفوعة
+        if uploaded_files:
+            st.markdown("**الملفات المرفوعة:**")
+            for i, file in enumerate(uploaded_files):
+                st.markdown(f"- {file.name} ({file.size:,} بايت)")
+        
+        # زر التسجيل
+        submitted = st.form_submit_button("💾 تسجيل البريد الوارد", use_container_width=True)
         
         if submitted:
-            if not sender_name or not subject:
-                st.error("الرجاء ملء الحقول الإلزامية (*)")
+            # التحقق من صحة البيانات
+            validation_errors = []
+            
+            if not sender_name:
+                validation_errors.append("اسم المرسل مطلوب")
+            
+            if not subject:
+                validation_errors.append("الموضوع مطلوب")
+            
+            if contact_choice == "--- اختر من جهات الاتصال ---" and not add_new_sender:
+                validation_errors.append("الرجاء اختيار المرسل من القائمة أو تفعيل خيار 'إضافة مرسل جديد'")
+            
+            if validation_errors:
+                for error in validation_errors:
+                    st.error(f"❌ {error}")
             else:
                 conn = get_db_connection()
                 cursor = conn.cursor()
                 
                 try:
+                    # حفظ المرفقات
                     attachments = []
                     if uploaded_files:
                         for file in uploaded_files:
@@ -1238,27 +2100,84 @@ def register_incoming_mail():
                             if filepath:
                                 attachments.append(os.path.basename(filepath))
                     
+                    # تسجيل البريد الوارد
                     cursor.execute('''
                     INSERT INTO incoming_mail 
-                    (reference_no, sender_name, subject, content, received_date, 
+                    (reference_no, sender_id, sender_name, subject, content, received_date, 
                      priority, status, category, due_date, attachments, notes, recorded_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (reference_no, sender_name, subject, content, received_date.strftime('%Y-%m-%d'),
-                          priority, "جديد", category, 
-                          due_date.strftime('%Y-%m-%d') if due_date else None,
-                          json.dumps(attachments) if attachments else None,
-                          notes, st.session_state.user['id']))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        reference_no,
+                        sender_id,  # يمكن أن يكون NULL إذا كان مرسل جديد
+                        sender_name,
+                        subject,
+                        content,
+                        received_date.strftime('%Y-%m-%d'),
+                        priority,
+                        "جديد",  # الحالة الافتراضية
+                        category,
+                        due_date.strftime('%Y-%m-%d') if due_date else None,
+                        json.dumps(attachments) if attachments else None,
+                        notes,
+                        st.session_state.user['id']
+                    ))
                     
                     conn.commit()
+                    
+                    # إذا كان مرسلاً جديداً، عرض خيار لإضافته لجهات الاتصال
+                    if add_new_sender and sender_id is None:
+                        st.info(f"👤 المرسل '{sender_name}' ليس في قاعدة جهات الاتصال.")
+                        
+                        col_add, col_skip = st.columns(2)
+                        with col_add:
+                            if st.button("➕ إضافة لجهات الاتصال", key="add_to_contacts"):
+                                # توليد كود تلقائي
+                                cursor.execute("SELECT MAX(CAST(SUBSTR(code, 2) AS INTEGER)) FROM contacts WHERE code LIKE 'C%'")
+                                result = cursor.fetchone()[0]
+                                next_code = f"C{(result or 0) + 1:03d}"
+                                
+                                cursor.execute('''
+                                INSERT INTO contacts (code, name)
+                                VALUES (?, ?)
+                                ''', (next_code, sender_name))
+                                
+                                conn.commit()
+                                st.success(f"✅ تمت إضافة '{sender_name}' لجهات الاتصال بالكود: {next_code}")
+                        
+                        with col_skip:
+                            if st.button("تخطي", key="skip_add_contact"):
+                                st.info("تم تخطي إضافة المرسل لجهات الاتصال")
+                    
                     log_activity(st.session_state.user['id'], "تسجيل بريد وارد", 
-                               f"رقم المرجع: {reference_no}")
+                               f"رقم المرجع: {reference_no} - المرسل: {sender_name}")
+                    
                     st.success(f"✅ تم تسجيل البريد الوارد بنجاح!")
                     st.balloons()
+                    
+                    # عرض ملخص البريد المسجل
+                    with st.expander("📋 ملخص البريد المسجل", expanded=True):
+                        summary_data = {
+                            "رقم المرجع": reference_no,
+                            "المرسل": sender_name,
+                            "الموضوع": subject,
+                            "تاريخ الاستلام": received_date.strftime('%Y-%m-%d'),
+                            "الأولوية": priority,
+                            "التصنيف": category,
+                            "تاريخ الاستحقاق": due_date.strftime('%Y-%m-%d') if due_date else "غير محدد",
+                            "عدد المرفقات": len(attachments)
+                        }
+                        
+                        for key, value in summary_data.items():
+                            st.markdown(f"**{key}:** {value}")
+                    
+                    # إعادة تعيين النموذج
+                    st.rerun()
                     
                 except sqlite3.IntegrityError:
                     st.error(f"❌ رقم المرجع '{reference_no}' موجود مسبقاً!")
                 except Exception as e:
                     st.error(f"❌ خطأ في التسجيل: {str(e)}")
+                    st.exception(e)
                 finally:
                     conn.close()
 
